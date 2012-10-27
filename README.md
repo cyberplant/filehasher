@@ -1,0 +1,4 @@
+hasher
+======
+
+File hashing utility.
