@@ -1,4 +1,82 @@
-hasher
-======
+Preliminary
+===========
 
-File hashing utility.
+I have a large multimedia collection of pictures/videos of my family, travel, etc.
+
+I also have those files in a hosting, published with a media album (that I'm developing, also).
+
+The need for 'hasher' started when I renamed a set of directories and files, and have to 
+synchronize the changes with the hosting. My upload bandwidth is very limited, so I cannot 
+afford to upload 100Gb of files again (it would take like two months 24hs!).
+
+So, if you have a large set of files and want to synchronize some changes in directories or
+filenames, hasher is the right tool for you.
+
+I use rsync for the file copy, so it would be a good companion for it.
+
+First Time Usage
+================
+
+1) Download hasher to your two (or more) machines. The 'source' and 'destination'.
+
+2) Generate hashes in the two collections, so the program know which files are 
+   the same than others.
+
+   [machine1] % python ~/hasher/hasher.py -g .orig-hashes
+
+   [machine2] % python ~/hasher/hasher.py -g .dest-hashes
+
+3) Copy the orig-hashes to 'destination' machine.
+
+   [machine1] % scp .orig-hashes user@destination:directory
+
+4) Compare the hashes
+
+   [machine2] % python ~/hasher/hasher.py -c .dest-hashes .orig-hashes
+
+   This will tell you a lot of things, which files have changed, which files
+   are missing from one list of files, etc. If you miss something, don't worry,
+   the program has created a file named "hasher_script.sh" that you have to 
+   edit and run.
+
+5) Edit the file hasher_script.sh
+
+   At the beginning are the mkdir's needed. After that the moves needed to make
+   the 'destination' file set equal to 'source' file set.
+
+   After that you will see rmdirs of directories that now can be empty. Maybe 
+   they are not empty, you will have to check manually, or uncomment them, if
+   they are not empty anyways they will don't be removed (rmdir will raise an
+   error).
+
+   After the rmdirs you can see a lot of rm's commented. Now you will have to
+   use your text editing skills. This is a list of duplicated files. You have
+   to uncomment the line of the rm of the file that you don't want to keep.
+
+6) Run the modified script file
+
+   After this you will have a very similar directory in 'destination' compared
+   to 'source'. In my own experience, it's better to run a second time so you
+   can check any smaller differences with more time.
+
+After the first time Usage
+==========================
+
+1) Update the hashes in the two collections
+
+   [machine1] % python ~/hasher/hasher.py -u .orig-hashes
+
+   [machine2] % python ~/hasher/hasher.py -u .dest-hashes
+
+2) See steps 3 to 6 from "First time Usage" 
+
+
+Credits
+=======
+
+- When I started this project there was a lot of things that didn't know
+  how to do, so I want to thanks Internet and Google for making it possible :)
+
+- @CMAD, that made me realize what I really need! Thanks!
+
+- My great girlfriend @roschegel, she helped me testing it. I love you! :)
