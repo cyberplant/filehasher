@@ -235,8 +235,8 @@ def compare(md5file1, md5file2):
                     repeated_file[1],
                     repeated_file[3]))
 
-    if output_file_list != []:
-        output_file_list[0].close()
+    if output_file != []:
+        output_file.close()
 
 
 def tee(o, s):
