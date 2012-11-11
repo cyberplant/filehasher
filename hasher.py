@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import os
 import md5
 import sys
@@ -140,7 +142,9 @@ def load_hashfile(filename, destDict=None, cache_data=None):
 
 
 def compare(md5file1, md5file2):
-    output_file_list = []
+    global output_file
+
+    output_file = None
 
     md5a = load_hashfile(md5file1)
     md5b = load_hashfile(md5file2)
@@ -192,7 +196,7 @@ def compare(md5file1, md5file2):
         for i in md5b:
             print i, md5b[i]
     if commands:
-        tee(output_file_list, "\n# Commands to execute in console:")
+        tee(output_file, "\n# Commands to execute in console:")
 
         mkdirs_list = list(mkdirs)
         rmdirs_list = list(rmdirs)
@@ -202,31 +206,31 @@ def compare(md5file1, md5file2):
         rmdirs_list.reverse()
         commands.sort()
 
-        tee(output_file_list, "\n# mkdir statements.\n")
+        tee(output_file, "\n# mkdir statements.\n")
         for i in mkdirs_list:
-            tee(output_file_list, i)
+            tee(output_file, i)
 
-        tee(output_file_list, "\n# mv statements.\n")
+        tee(output_file, "\n# mv statements.\n")
         for i in commands:
-            tee(output_file_list, i)
+            tee(output_file, i)
 
-        tee(output_file_list, "\n# Directories possibly empty from now. " +
+        tee(output_file, "\n# Directories possibly empty from now. " +
                               "Please check.\n")
         for i in rmdirs_list:
-            tee(output_file_list, "#" + i)
+            tee(output_file, "#" + i)
 
     if repeated:
-        tee(output_file_list, """
+        tee(output_file, """
 # Those files are repeated. You can remove one or many of them if you wish:")
 # (Note: if the inode is the same, there is no space wasted)
 """)
         for key in repeated:
 
-            tee(output_file_list, "\n# Key: " + key + " - Size: " +
+            tee(output_file, "\n# Key: " + key + " - Size: " +
                 repeated[key][0][2])
 
             for repeated_file in repeated[key]:
-                tee(output_file_list, "# rm '%s/%s' # inode: %s" % (
+                tee(output_file, "# rm '%s/%s' # inode: %s" % (
                     repeated_file[0],
                     repeated_file[1],
                     repeated_file[3]))
@@ -235,14 +239,14 @@ def compare(md5file1, md5file2):
         output_file_list[0].close()
 
 
-def tee(output_file_list, s):
-    if output_file_list == []:
-        output_file = open(DEFAULT_FILENAME, "w")
-        output_file_list.append(output_file)
-    else:
-        output_file = output_file_list[0]
+def tee(o, s):
+    if o == None:
+        o = open(SCRIPT_FILENAME, "w")
 
-    output_file.write(s + "\n")
+        global output_file
+        output_file = o
+
+    o.write(s + "\n")
     print s
 
 
@@ -280,6 +284,8 @@ def asserted_open(filename, mode):
 
 
 if __name__ == "__main__":
+    filename1 = DEFAULT_FILENAME
+
     if len(sys.argv) < 2:
         show_usage(sys.argv[0])
         sys.exit(1)
