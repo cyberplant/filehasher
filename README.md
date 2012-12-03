@@ -35,7 +35,7 @@ First Time Usage
 ```
    This will tell you a lot of things, which files have changed, which files
    are missing from one list of files, etc. If you miss something, don't worry,
-   the program has created a file named *hasher_script.sh* that you have to 
+   the program has created a file named **hasher_script.sh** that you have to 
    edit and run.
 
 5. Edit the file **hasher_script.sh**
