@@ -5,7 +5,7 @@ I have a large multimedia collection of pictures/videos of my family, travel, et
 
 I also have those files in a hosting, published with a media album (that I''m developing, also).
 
-The need for _hasher_ started when I renamed a set of directories and files, and have to 
+The need for **_hasher_** started when I renamed a set of directories and files, and have to 
 synchronize the changes with the hosting. My upload bandwidth is very limited, so I cannot 
 afford to upload 100Gb of files again (it would take like two months 24hs!).
 
@@ -17,29 +17,28 @@ I use rsync for the file copy, so it would be a good companion for it.
 First Time Usage
 ----------------
 
-1) Download hasher to your two (or more) machines. The _source_ and _destination_.
+1. Download **_hasher_** to your two (or more) machines. The _source_ and _destination_.
 
-2) Generate hashes in the two collections, so the program know which files are 
+2. Generate hashes in the two collections, so the program know which files are 
    the same than others.
-
-   [_source_] % python ~/hasher/hasher.py -g .orig-hashes
-
-   [_destination_] % python ~/hasher/hasher.py -g .dest-hashes
-
-3) Copy the orig-hashes to _destination_ machine.
-
-   [_source_] % scp .orig-hashes user@destination:directory
-
-4) Compare the hashes
-
-   [_destination_] % python ~/hasher/hasher.py -c .dest-hashes .orig-hashes
-
+```
+   [user@source] % python ~/hasher/hasher.py -g .orig-hashes
+   [user@destination] % python ~/hasher/hasher.py -g .dest-hashes
+```
+3. Copy the orig-hashes to _destination_ machine.
+```
+    [user@source] % scp .orig-hashes user@destination:directory
+```
+4. Compare the hashes
+```
+    [user@destination] % python ~/hasher/hasher.py -c .dest-hashes .orig-hashes
+```
    This will tell you a lot of things, which files have changed, which files
    are missing from one list of files, etc. If you miss something, don''t worry,
    the program has created a file named *hasher_script.sh* that you have to 
    edit and run.
 
-5) Edit the file hasher_script.sh
+5. Edit the file **hasher_script.sh**
 
    At the beginning are the mkdir''s needed. After that the moves needed to make
    the _destination_ file set equal to _source_ file set.
@@ -53,7 +52,7 @@ First Time Usage
    use your text editing skills. This is a list of duplicated files. You have
    to uncomment the line of the rm of the file that you don''t want to keep.
 
-6) Run the modified script file
+6. Run the modified script file
 
    After this you will have a very similar directory in _destination_ compared
    to _source_. In my own experience, it''s better to run a second time so you
@@ -62,13 +61,13 @@ First Time Usage
 Common Usage
 ------------
 
-1) Update the hashes in the two collections
+1. Update the hashes in the two collections
+```
+   user@source % python ~/hasher/hasher.py -u .orig-hashes
 
-   [_source_] % python ~/hasher/hasher.py -u .orig-hashes
-
-   [_destination_] % python ~/hasher/hasher.py -u .dest-hashes
-
-2) See steps 3 to 6 from "First time Usage" 
+   user@destination % python ~/hasher/hasher.py -u .dest-hashes
+```
+2. See steps 3 to 6 from "First time Usage" 
 
 
 Credits/Thanks
