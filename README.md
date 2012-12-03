@@ -3,7 +3,7 @@ Preliminary
 
 I have a large multimedia collection of pictures/videos of my family, travel, etc.
 
-I also have those files in a hosting, published with a media album (that I''m developing, also).
+I also have those files in a hosting, published with a media album (that I'm developing, also).
 
 The need for **_hasher_** started when I renamed a set of directories and files, and have to 
 synchronize the changes with the hosting. My upload bandwidth is very limited, so I cannot 
@@ -34,28 +34,28 @@ First Time Usage
     [user@destination] % python ~/hasher/hasher.py -c .dest-hashes .orig-hashes
 ```
    This will tell you a lot of things, which files have changed, which files
-   are missing from one list of files, etc. If you miss something, don''t worry,
+   are missing from one list of files, etc. If you miss something, don't worry,
    the program has created a file named *hasher_script.sh* that you have to 
    edit and run.
 
 5. Edit the file **hasher_script.sh**
 
-   At the beginning are the mkdir''s needed. After that the moves needed to make
+   At the beginning are the mkdir's needed. After that the moves needed to make
    the _destination_ file set equal to _source_ file set.
 
    After that you will see rmdirs of directories that now can be empty. Maybe 
    they are not empty, you will have to check manually, or uncomment them, if
-   they are not empty anyways they will don''t be removed (rmdir will raise an
+   they are not empty anyways they will don't be removed (rmdir will raise an
    error).
 
    After the rmdirs you can see a lot of "rm"s commented. Now you will have to
    use your text editing skills. This is a list of duplicated files. You have
-   to uncomment the line of the rm of the file that you don''t want to keep.
+   to uncomment the line of the rm of the file that you don't want to keep.
 
 6. Run the modified script file
 
    After this you will have a very similar directory in _destination_ compared
-   to _source_. In my own experience, it''s better to run a second time so you
+   to _source_. In my own experience, it's better to run a second time so you
    can check any smaller differences with more time.
 
 Common Usage
@@ -73,7 +73,7 @@ Common Usage
 Credits/Thanks
 --------------
 
-- When I started this project there were a lot of things that I didn''t know
+- When I started this project there were a lot of things that I didn't know
   how to do, so I want to thanks Internet and Google for making it possible :)
 
 - @CMAD, that made me realize what I really need! Thanks!
