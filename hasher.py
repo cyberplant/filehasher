@@ -254,18 +254,14 @@ def show_usage(appName):
     print """
 Usage:
 
-  Default filename: %defaultfilename%
+  Default filename: {defaultfilename}
 
-  %appname% -g {filename} generate hashes (remove hashfile if exists)
-  %appname% -a {filename} append hashes to file
-  %appname% -u {filename} update hashfile (clean old entries, and append new)
-  %appname% -c [filename1] [filename2] compares hashes from hashfiles
+  {appname} -g {{filename}} generate hashes (remove hashfile if exists)
+  {appname} -a {{filename}} append hashes to file
+  {appname} -u {{filename}} update hashfile (clean old entries, and append new)
+  {appname} -c [filename1] [filename2] compares hashes from hashfiles
 
-""".replace(
-        "%appname%", appName
-    ).replace(
-        "%defaultfilename%", DEFAULT_FILENAME
-    )
+""".format(appname=appName, defaultfilename=DEFAULT_FILENAME)
 
 
 def asserted_open(filename, mode):
