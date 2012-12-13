@@ -74,7 +74,7 @@ Credits/Thanks
 --------------
 
 - When I started this project there were a lot of things that I didn't know
-  how to do, so I want to thanks Internet and Google for making it possible :)
+  how to do, so I want to thanks Internet and Google for helping me out :)
 
 - @CMAD, that made me realize what I really need! Thanks!
 
