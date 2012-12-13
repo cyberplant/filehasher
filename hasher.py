@@ -235,7 +235,7 @@ def compare(md5file1, md5file2):
                     repeated_file[1],
                     repeated_file[3]))
 
-    if output_file != []:
+    if output_file is not None:
         output_file.close()
 
 
