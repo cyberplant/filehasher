@@ -215,7 +215,7 @@ def compare(md5file1, md5file2):
             tee(output_file, i)
 
         tee(output_file, "\n# Directories possibly empty from now. " +
-                              "Please check.\n")
+                         "Please check.\n")
         for i in rmdirs_list:
             tee(output_file, "#" + i)
 
@@ -240,7 +240,7 @@ def compare(md5file1, md5file2):
 
 
 def tee(o, s):
-    if o == None:
+    if o is None:
         o = open(SCRIPT_FILENAME, "w")
 
         global output_file
