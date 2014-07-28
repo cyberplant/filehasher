@@ -1,0 +1,8 @@
+image: python2.7
+
+env:
+  - TESTING=1
+
+script:
+  - python setup.py install
+  - filehasher -h
