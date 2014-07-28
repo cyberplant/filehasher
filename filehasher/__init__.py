@@ -5,7 +5,6 @@ import md5
 import sys
 
 BLOCKSIZE = 1024 * 1024
-DEFAULT_FILENAME = ".hashes"
 SCRIPT_FILENAME = "hasher_script.sh"
 repeated = {}
 
@@ -288,21 +287,6 @@ def tee(o, s):
     print s
 
 
-def show_usage(appName):
-    print """
-Usage:
-
-  Default filename: {defaultfilename}
-
-  {appname} -g {{filename}} generate hashes (remove hashfile if exists)
-  {appname} -a {{filename}} append hashes to file
-  {appname} -u {{filename}} update hashfile (clean old entries, and append new)
-  {appname} -c [filename1] {{filename2}} compares hashes from hashfiles, use
-               with only one filename to check dupes in directory
-
-""".format(appname=appName, defaultfilename=DEFAULT_FILENAME)
-
-
 def _asserted_open(filename, mode):
     f = None
     try:
@@ -316,32 +300,3 @@ def _asserted_open(filename, mode):
         raise e
 
     return f
-
-
-if __name__ == "__main__":
-    filename1 = DEFAULT_FILENAME
-
-    if len(sys.argv) < 2:
-        show_usage(sys.argv[0])
-        sys.exit(1)
-
-    if len(sys.argv) > 2:
-        filename1 = sys.argv[2]
-
-    if sys.argv[1].lower() == "-g":
-        generate_hashes(filename1)
-    elif sys.argv[1].lower() == "-a":
-        generate_hashes(filename1, append=True)
-    elif sys.argv[1].lower() == "-u":
-        generate_hashes(filename1, update=True)
-    elif sys.argv[1].lower() == "-c":
-        if len(sys.argv) < 3:
-            print "Error. Not enough parameters."
-            show_usage(sys.argv[0])
-            sys.exit(1)
-        filename2 = None
-        if len(sys.argv) > 3:
-            filename2 = sys.argv[3]
-        compare(filename1, filename2)
-
-    sys.exit(0)

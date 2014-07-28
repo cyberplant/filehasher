@@ -7,5 +7,6 @@ setup(name='filehasher',
       author='Luar Roji',
       author_email='cyberplant@roji.net',
       license='MIT',
+      scripts=['bin/filehasher'],
       packages=['filehasher'],
       zip_safe=False)
