@@ -1,8 +1,12 @@
-image: python2.7
-
-env:
-  - TESTING=1
+image: bradrydzewski/base
 
 script:
-  - python setup.py install
-  - filehasher -h
+  - sudo python setup.py install
+  - filehasher -g
+  - filehasher -u
+  - filehasher -c .hashes .hashes
+
+publish:
+    pypi:
+        username: {{ username }}
+        password: {{ password }}
