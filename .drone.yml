@@ -1,7 +1,7 @@
 image: bradrydzewski/base
 
 script:
-  - sudo python setup.py install
+  - python setup.py install --user
   - filehasher -g
   - filehasher -u
   - filehasher -c .hashes .hashes
