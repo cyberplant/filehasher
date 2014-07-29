@@ -2,6 +2,7 @@ image: bradrydzewski/base
 
 script:
   - python setup.py install --user
+  - export PATH=$PATH:~/.local/bin
   - filehasher -g
   - filehasher -u
   - filehasher -c .hashes .hashes
