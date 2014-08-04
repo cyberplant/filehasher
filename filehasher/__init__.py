@@ -5,7 +5,7 @@ import md5
 import sys
 
 BLOCKSIZE = 1024 * 1024
-SCRIPT_FILENAME = "hasher_script.sh"
+SCRIPT_FILENAME = "filehasher_script.sh"
 repeated = {}
 
 
