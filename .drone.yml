@@ -7,6 +7,7 @@ script:
   - filehasher -u
   - filehasher -c .hashes .hashes
 
+
 publish:
     pypi:
         username: {{username}}
