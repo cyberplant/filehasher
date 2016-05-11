@@ -19,6 +19,26 @@ def _getMD5(s):
     return _hexify(md5sum.digest())
 
 
+def calculate_md5(f):
+    md5sum = md5.new()
+    readcount = 0
+    dirty = False
+    while 1:
+        block = f.read(BLOCKSIZE)
+        if not block:
+            break
+        readcount = readcount + 1
+        if readcount > 10 and readcount % 23 == 0:
+            if dirty:
+                sys.stdout.write("\b")
+            dirty = True
+            sys.stdout.write(("/", "|", '\\', "-")[readcount % 4])
+            sys.stdout.flush()
+        md5sum.update(block)
+
+    return md5sum, dirty
+
+
 def generate_hashes(hash_file, update=False, append=False):
     cache = {}
     if (append or update) and os.path.exists(hash_file):
@@ -75,22 +95,13 @@ def generate_hashes(hash_file, update=False, append=False):
                                                     cache_data[4])
                     outfile.write(output + "\n")
             else:
+
                 f = open(full_filename, "rb")
-                md5sum = md5.new()
-                readcount = 0
-                dirty = False
-                while 1:
-                    block = f.read(BLOCKSIZE)
-                    if not block:
-                        break
-                    readcount = readcount + 1
-                    if readcount > 10 and readcount % 23 == 0:
-                        if dirty:
-                            sys.stdout.write("\b")
-                        dirty = True
-                        sys.stdout.write(("/", "|", '\\', "-")[readcount % 4])
-                        sys.stdout.flush()
-                    md5sum.update(block)
+                try:
+                    md5sum, dirty = calculate_md5(f)
+                except Exception, e:
+                    print "Error:", e
+                    continue
                 f.close()
                 output = "%s|%s|%s|%s|%d|%d" % (md5key,
                                                 _hexify(md5sum.digest()),
