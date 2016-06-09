@@ -13,3 +13,5 @@ script:
 - filehasher -g
 - filehasher -u
 - filehasher -c .hashes .hashes
+
+sudo: required
