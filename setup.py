@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='filehasher',
-      version='0.3',
+      version='0.4',
       description='File Hasher',
       url='http://github.com/cyberplant/filehasher',
       author='Luar Roji',
