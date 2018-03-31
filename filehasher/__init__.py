@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import os
-import md5
+import hashlib
 import sys
 
 BLOCKSIZE = 1024 * 1024
@@ -9,18 +9,12 @@ SCRIPT_FILENAME = "filehasher_script.sh"
 repeated = {}
 
 
-def _hexify(s):
-    return ("%02x" * len(s)) % tuple(map(ord, s))
-
-
 def _getMD5(s):
-    md5sum = md5.new(s)
-
-    return _hexify(md5sum.digest())
+    return hashlib.md5(s.encode()).hexdigest()
 
 
 def calculate_md5(f):
-    md5sum = md5.new()
+    md5sum = hashlib.md5()
     readcount = 0
     dirty = False
     while 1:
@@ -99,12 +93,12 @@ def generate_hashes(hash_file, update=False, append=False):
                 f = open(full_filename, "rb")
                 try:
                     md5sum, dirty = calculate_md5(f)
-                except Exception, e:
-                    print "Error:", e
+                except Exception as e:
+                    print("Error:", e)
                     continue
                 f.close()
                 output = "%s|%s|%s|%s|%d|%d" % (md5key,
-                                                _hexify(md5sum.digest()),
+                                                md5sum.hexdigest(),
                                                 subdir, filename, file_size,
                                                 file_inode)
                 outfile.write(output + "\n")
@@ -117,10 +111,10 @@ def generate_hashes(hash_file, update=False, append=False):
     if update:
         os.rename(new_hash_file, hash_file)
         if len(cache) > 0:
-            print "%d old cache entries cleaned." % len(cache)
+            print("%d old cache entries cleaned." % len(cache))
             for key in cache:
                 cache_data = cache[key]
-                print key + " -> " + cache_data[1] + "/" + cache_data[2]
+                print(key + " -> " + cache_data[1] + "/" + cache_data[2])
 
 
 def _load_hashfile(filename, destDict=None, cache_data=None):
@@ -186,7 +180,7 @@ def compare(md5file1, md5file2):
             # The files are the same
             continue
         else:
-            print "Different: ", fdata1, fdata2
+            print("Different: ", fdata1, fdata2)
             if fdata1[0] == fdata2[0]:
                 # Same directory, only filename changed
                 commands.append("mv -v '%s/%s' '%s/%s'" % (fdata1[0],
@@ -206,16 +200,16 @@ def compare(md5file1, md5file2):
 
     if md5file2:
         if onlyIn1:
-            print "\n# Those files only exist in", md5file1
+            print("\n# Those files only exist in", md5file1)
 
             for item in _sorted_filenames(onlyIn1):
-                print item
+                print(item)
 
         if md5b:
-            print "\n# Those files only exist in", md5file2
+            print("\n# Those files only exist in", md5file2)
 
             for item in _sorted_filenames(md5b):
-                print item
+                print(item)
 
     if commands:
         tee(output_file, "\n# Commands to execute in console:")
@@ -295,19 +289,19 @@ def tee(o, s):
         output_file = o
 
     o.write(s + "\n")
-    print s
+    print(s)
 
 
 def _asserted_open(filename, mode):
     f = None
     try:
         f = open(filename, mode)
-    except IOError, e:
-        print "I/O Error:", e
+    except IOError as e:
+        print("I/O Error:", e)
 
         sys.exit(2)
-    except Exception, e:
-        print "Error:", e
+    except Exception as e:
+        print("Error:", e)
         raise e
 
     return f

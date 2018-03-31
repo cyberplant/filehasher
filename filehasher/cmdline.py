@@ -44,3 +44,7 @@ def main():
         filehasher.compare(args.hashfile, args.compare)
 
     sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
