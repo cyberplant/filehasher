@@ -10,7 +10,7 @@ repeated = {}
 
 
 def _getMD5(s):
-    return hashlib.md5(s.encode()).hexdigest()
+    return hashlib.md5(s.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def calculate_md5(f):
@@ -78,6 +78,7 @@ def generate_hashes(hash_file, update=False, append=False):
                    str(file_stat.st_size) +
                    str(file_stat.st_mtime))
             md5key = _getMD5(key)
+            filename = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
             if md5key in cache:
                 sys.stdout.write("C")
