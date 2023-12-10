@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import filehasher
+from filehasher import FileHasher
 import sys
 import argparse
 
@@ -34,14 +34,16 @@ def main():
 
     args = parser.parse_args()
 
+    fh = FileHasher(args.hashfile)
+
     if args.generate:
-        filehasher.generate_hashes(args.hashfile)
+        fh.generate_hashes(append=False)
     elif args.append:
-        filehasher.generate_hashes(args.hashfile, append=True)
+        fh.generate_hashes(append=True)
     elif args.update:
-        filehasher.generate_hashes(args.hashfile, update=True)
+        fh.generate_hashes(update=True)
     elif args.compare:
-        filehasher.compare(args.hashfile, args.compare)
+        fh.compare(args.compare)
 
     sys.exit(0)
 
