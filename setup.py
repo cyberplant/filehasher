@@ -1,11 +1,11 @@
 from setuptools import setup
 
 setup(name='filehasher',
-      version='0.5',
+      version='0.6',
       description='File Hasher',
       url='http://github.com/cyberplant/filehasher',
       author='Luar Roji',
-      author_email='cyberplant@roji.net',
+      author_email='luar@roji.net',
       license='MIT',
       entry_points={
           'console_scripts': [
