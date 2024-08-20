@@ -1,7 +1,11 @@
 from setuptools import setup
 
+version = {}
+with open("filehasher/version.py") as fp:
+    exec(fp.read(), version)
+
 setup(name='filehasher',
-      version='0.6',
+      version=version["__version__"],
       description='File Hasher',
       url='http://github.com/cyberplant/filehasher',
       author='Luar Roji',

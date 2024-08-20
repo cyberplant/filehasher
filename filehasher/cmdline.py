@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
-from filehasher import FileHasher
+from .filehasher import FileHasher
+from .version import __version__
 import sys
 import argparse
 
@@ -8,7 +9,7 @@ DEFAULT_FILENAME = ".hashes"
 
 
 def main():
-    parser = argparse.ArgumentParser(description='File Hasher.')
+    parser = argparse.ArgumentParser(description=f'File Hasher v{__version__}.')
 
     parser.add_argument('--generate', '-g', action='store_true',
                         dest="generate",
@@ -44,6 +45,8 @@ def main():
         fh.generate_hashes(update=True)
     elif args.compare:
         fh.compare(args.compare)
+    else:
+        parser.print_help()
 
     sys.exit(0)
 
