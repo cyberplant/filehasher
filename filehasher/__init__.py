@@ -105,15 +105,18 @@ def _collect_files(hash_file: str, collect_paths: bool = False) -> Union[int, Li
     return result
 
 
-def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int) -> List[Tuple]:
+def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue: Optional['mp.Queue'] = None) -> List[Tuple]:
     """
     Process a batch of files for a single worker.
     This function runs in a separate process.
     """
     results = []
 
-    for subdir, filename, full_filename in worker_files:
+    for i, (subdir, filename, full_filename) in enumerate(worker_files):
         if os.path.islink(full_filename):
+            # Send progress update even for skipped files
+            if progress_queue:
+                progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
             continue
 
         file_stat = os.stat(full_filename)
@@ -134,6 +137,14 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         except Exception as e:
             print(f"Error processing {full_filename}: {e}")
             continue
+
+        # Send progress update for each processed file
+        if progress_queue:
+            progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
+
+    # Signal completion
+    if progress_queue:
+        progress_queue.put(('done', worker_id))
 
     return results
 
@@ -324,6 +335,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
     # Use Rich progress bars for parallel processing with individual worker progress
     if parallel and show_progress and HAS_RICH:
+        import threading
         console = Console()
 
         # Create individual progress bars for each worker
@@ -349,68 +361,98 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 task = progress.add_task(f"Worker {i+1}", total=worker_total, filename="")
                 worker_tasks.append(task)
 
+            # Create progress queues for real-time updates using Manager
+            with mp.Manager() as manager:
+                progress_queues = [manager.Queue() for _ in range(workers)]
+                worker_completed = manager.list([False] * workers)
 
-            # Process files on-the-fly with parallel workers using shared list
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Collect all files for processing
-                all_files = _collect_files(hash_file, collect_paths=True)
+                # Process files on-the-fly with parallel workers using shared list
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    # Collect all files for processing
+                    all_files = _collect_files(hash_file, collect_paths=True)
 
-                # Distribute files among workers more evenly
-                files_per_worker = len(all_files) // workers
-                extra_files = len(all_files) % workers
+                    # Distribute files among workers more evenly
+                    files_per_worker = len(all_files) // workers
+                    extra_files = len(all_files) % workers
 
-                worker_file_lists = []
-                start_idx = 0
-                for i in range(workers):
-                    worker_files = files_per_worker
-                    if i < extra_files:
-                        worker_files += 1
-                    end_idx = start_idx + worker_files
-                    worker_file_lists.append(all_files[start_idx:end_idx])
-                    start_idx = end_idx
+                    worker_file_lists = []
+                    start_idx = 0
+                    for i in range(workers):
+                        worker_files = files_per_worker
+                        if i < extra_files:
+                            worker_files += 1
+                        end_idx = start_idx + worker_files
+                        worker_file_lists.append(all_files[start_idx:end_idx])
+                        start_idx = end_idx
 
-                # Submit all worker tasks at once
-                future_to_worker = {}
-                for worker_id, worker_files in enumerate(worker_file_lists):
-                    if worker_files:  # Only create task if worker has files
-                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id)
-                        future_to_worker[future] = worker_id
+                    # Submit all worker tasks at once
+                    future_to_worker = {}
+                    for worker_id, worker_files in enumerate(worker_file_lists):
+                        if worker_files:  # Only create task if worker has files
+                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id])
+                            future_to_worker[future] = worker_id
 
-                # Process results as they complete
-                for future in as_completed(future_to_worker):
-                    worker_id = future_to_worker[future]
-                    try:
-                        batch_results = future.result()
-                        for result in batch_results:
-                            if result:
-                                hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
-                                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                    # Function to monitor progress queues
+                    def monitor_progress():
+                        while not all(worker_completed):
+                            for worker_id in range(workers):
+                                if worker_completed[worker_id]:
+                                    continue
+                                try:
+                                    message = progress_queues[worker_id].get_nowait()
+                                    if message[0] == 'progress':
+                                        _, wid, advance, filename = message
+                                        progress.update(worker_tasks[wid], advance=advance,
+                                                      filename=os.path.basename(filename) if verbose and filename else "")
+                                    elif message[0] == 'done':
+                                        worker_completed[message[1]] = True
+                                except:
+                                    # Queue empty, continue
+                                    pass
+                            time.sleep(0.01)  # Small delay to avoid busy waiting
 
-                                if hashkey in cache:
-                                    if update:
-                                        cache_data = cache.pop(hashkey)
-                                        output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                    # Start progress monitoring thread
+                    monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+                    monitor_thread.start()
+
+                    # Process results as they complete
+                    for future in as_completed(future_to_worker):
+                        worker_id = future_to_worker[future]
+                        try:
+                            batch_results = future.result()
+                            for result in batch_results:
+                                if result:
+                                    hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
+                                    filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+
+                                    if hashkey in cache:
+                                        if update:
+                                            cache_data = cache.pop(hashkey)
+                                            output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                            outfile.write(output + "\n")
+                                    else:
+                                        output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                                         outfile.write(output + "\n")
-                                else:
-                                    output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
-                                    outfile.write(output + "\n")
 
-                        # Update progress for entire batch at once
-                        batch_size = len(batch_results)
-                        if batch_results:
-                            last_result = batch_results[-1]
-                            processed_filename = last_result[6] if len(last_result) > 6 else None
-                            progress.update(worker_tasks[worker_id], advance=batch_size,
-                                          filename=os.path.basename(processed_filename) if verbose and processed_filename else "")
+                        except Exception as e:
+                            print(f"Error in worker {worker_id}: {e}")
+                            # Mark worker as completed to avoid hanging
+                            worker_completed[worker_id] = True
 
-                    except Exception as e:
-                        print(f"Error in worker {worker_id}: {e}")
-                        # Still update progress to avoid hanging
-                        worker_files = worker_file_lists[worker_id]
-                        progress.update(worker_tasks[worker_id], advance=len(worker_files))
+                    # Wait for progress monitoring to complete
+                    monitor_thread.join()
+
+                    # Clean up queues
+                    for q in progress_queues:
+                        try:
+                            while not q.empty():
+                                q.get_nowait()
+                        except:
+                            pass
 
     elif parallel and show_progress and HAS_TQDM:
-        # Fallback to tqdm for parallel processing
+        # Fallback to tqdm for parallel processing with progress queues
+        import threading
         progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
 
         # Collect all files for tqdm implementation
@@ -430,43 +472,77 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             worker_file_lists.append(all_files[start_idx:end_idx])
             start_idx = end_idx
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            # Submit worker tasks
-            future_to_worker = {}
-            for worker_id, worker_files in enumerate(worker_file_lists):
-                if worker_files:
-                    future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id)
-                    future_to_worker[future] = worker_id
+        # Create progress queues for real-time updates using Manager
+        with mp.Manager() as manager:
+            progress_queues = [manager.Queue() for _ in range(workers)]
+            worker_completed = manager.list([False] * workers)
 
-            # Process results
-            for future in as_completed(future_to_worker):
-                worker_id = future_to_worker[future]
-                try:
-                    batch_results = future.result()
-                    for result in batch_results:
-                        if result:
-                            hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
-                            filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                # Submit worker tasks
+                future_to_worker = {}
+                for worker_id, worker_files in enumerate(worker_file_lists):
+                    if worker_files:
+                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id])
+                        future_to_worker[future] = worker_id
 
-                            if hashkey in cache:
-                                if update:
-                                    cache_data = cache.pop(hashkey)
-                                    output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                # Function to monitor progress queues
+                def monitor_progress():
+                    while not all(worker_completed):
+                        for worker_id in range(workers):
+                            if worker_completed[worker_id]:
+                                continue
+                            try:
+                                message = progress_queues[worker_id].get_nowait()
+                                if message[0] == 'progress':
+                                    _, wid, advance, filename = message
+                                    if verbose and filename:
+                                        progress_bar.set_description(f"Worker {wid+1}: {os.path.basename(filename)}")
+                                    progress_bar.update(advance)
+                                elif message[0] == 'done':
+                                    worker_completed[message[1]] = True
+                            except:
+                                # Queue empty, continue
+                                pass
+                        time.sleep(0.01)  # Small delay to avoid busy waiting
+
+                # Start progress monitoring thread
+                monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+                monitor_thread.start()
+
+                # Process results
+                for future in as_completed(future_to_worker):
+                    worker_id = future_to_worker[future]
+                    try:
+                        batch_results = future.result()
+                        for result in batch_results:
+                            if result:
+                                hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
+                                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+
+                                if hashkey in cache:
+                                    if update:
+                                        cache_data = cache.pop(hashkey)
+                                        output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                        outfile.write(output + "\n")
+                                else:
+                                    output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                                     outfile.write(output + "\n")
-                            else:
-                                output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
-                                outfile.write(output + "\n")
 
-                            # Show filename if verbose
-                            if verbose and processed_filename:
-                                progress_bar.set_description(f"Processing: {os.path.basename(processed_filename)}")
+                    except Exception as e:
+                        print(f"Error in worker {worker_id}: {e}")
+                        # Mark worker as completed to avoid hanging
+                        worker_completed[worker_id] = True
 
-                    progress_bar.update(len(batch_results))
+                # Wait for progress monitoring to complete
+                monitor_thread.join()
 
-                except Exception as e:
-                    print(f"Error in worker {worker_id}: {e}")
-                    worker_files = worker_file_lists[worker_id]
-                    progress_bar.update(len(worker_files))
+                # Clean up queues
+                for q in progress_queues:
+                    try:
+                        while not q.empty():
+                            q.get_nowait()
+                    except:
+                        pass
 
         progress_bar.close()
 
