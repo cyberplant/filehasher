@@ -113,7 +113,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
     """
     results = []
 
-    for i, (subdir, filename, full_filename) in enumerate(worker_files):
+    for subdir, filename, full_filename in worker_files:
         if os.path.islink(full_filename):
             # Send progress update even for skipped files
             if progress_queue:
