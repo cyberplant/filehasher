@@ -1,8 +1,11 @@
 from setuptools import setup
 
+# Read version from filehasher/version.py
+exec(open('filehasher/version.py').read())
+
 setup(name='filehasher',
-      version='0.7',
-      description='File Hasher with multiple algorithms and benchmarking',
+      version=__version__,
+      description='Modern file hashing utility with parallel processing, multiple algorithms, and benchmarking',
       url='http://github.com/cyberplant/filehasher',
       author='Luar Roji',
       author_email='cyberplant@roji.net',
@@ -20,17 +23,18 @@ setup(name='filehasher',
           'filehasher', 'file', 'hasher', 'hash', 'benchmark', 'dupe', 'duplicate'
       ],
       classifiers=[
-          'Development Status :: 4 - Beta',
+          'Development Status :: 5 - Production/Stable',
           'Operating System :: OS Independent',
           'Programming Language :: Python :: 3',
-          'Programming Language :: Python :: 3.6',
-          'Programming Language :: Python :: 3.7',
           'Programming Language :: Python :: 3.8',
           'Programming Language :: Python :: 3.9',
           'Programming Language :: Python :: 3.10',
           'Programming Language :: Python :: 3.11',
+          'Programming Language :: Python :: 3.12',
           'Topic :: Software Development :: Libraries :: Python Modules',
           'Topic :: System :: Filesystems',
           'Topic :: Utilities',
+          'Topic :: System :: Archiving',
+          'License :: OSI Approved :: MIT License',
       ],
       zip_safe=True)
