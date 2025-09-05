@@ -4,6 +4,7 @@ import os
 import hashlib
 import sys
 import time
+import queue
 import configparser
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
@@ -406,8 +407,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                       filename=os.path.basename(filename) if verbose and filename else "")
                                     elif message[0] == 'done':
                                         worker_completed[message[1]] = True
-                                except Exception:
-                                    # Queue empty or other queue-related exception, continue
+                                except queue.Empty:
+                                    # Queue is empty, continue monitoring
                                     pass
                             time.sleep(0.01)  # Small delay to avoid busy waiting
 
@@ -447,7 +448,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         try:
                             while not q.empty():
                                 q.get_nowait()
-                        except Exception:
+                        except queue.Empty:
                             pass
 
     elif parallel and show_progress and HAS_TQDM:
@@ -500,8 +501,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     progress_bar.update(advance)
                                 elif message[0] == 'done':
                                     worker_completed[message[1]] = True
-                            except Exception:
-                                # Queue empty or other queue-related exception, continue
+                            except queue.Empty:
+                                # Queue is empty, continue monitoring
                                 pass
                         time.sleep(0.01)  # Small delay to avoid busy waiting
 
@@ -541,7 +542,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     try:
                         while not q.empty():
                             q.get_nowait()
-                    except Exception:
+                    except queue.Empty:
                         pass
 
         progress_bar.close()
