@@ -410,7 +410,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 except queue.Empty:
                                     # Queue is empty, continue monitoring
                                     pass
-                            time.sleep(0.000001)  # Small delay to avoid busy waiting
+                            time.sleep(0)  # Yield control to avoid busy waiting
 
                     # Start progress monitoring thread
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
@@ -496,7 +496,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             except queue.Empty:
                                 # Queue is empty, continue monitoring
                                 pass
-                        time.sleep(0.01)  # Small delay to avoid busy waiting
+                        time.sleep(0)  # Yield control to avoid busy waiting
 
                 # Start progress monitoring thread
                 monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
