@@ -14,6 +14,7 @@ setup(name='filehasher',
       packages=['filehasher'],
       install_requires=[
           'tqdm>=4.0.0',
+          'rich>=10.0.0',
       ],
       keywords=[
           'filehasher', 'file', 'hasher', 'hash', 'benchmark', 'dupe', 'duplicate'

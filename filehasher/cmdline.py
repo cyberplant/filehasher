@@ -16,6 +16,8 @@ Examples:
   %(prog)s --benchmark
   %(prog)s --compare other.hashes
   %(prog)s --update --algorithm md5
+  %(prog)s --generate --parallel --workers 4
+  %(prog)s --generate --parallel --algorithm sha256
 
 Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
         """
@@ -65,6 +67,15 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
     parser.add_argument('--quiet', '-q', action='store_true',
                         dest="quiet",
                         help="Suppress progress output")
+
+    # Parallel processing
+    parser.add_argument('--parallel', '-P', action='store_true',
+                        dest="parallel",
+                        help="Process files in parallel using multiple workers")
+
+    parser.add_argument('--workers', type=int, default=None,
+                        dest="workers",
+                        help="Number of parallel workers (default: CPU count)")
 
     parser.add_argument('hashfile', default='.hashes', nargs='?',
                         help="Hashes file. Default filename: %(default)s")
@@ -118,7 +129,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
         filehasher.generate_hashes(
             args.hashfile,
             algorithm=args.algorithm,
-            show_progress=show_progress
+            show_progress=show_progress,
+            parallel=args.parallel,
+            workers=args.workers
         )
     elif args.append:
         print(f"Appending {args.algorithm} hashes...")
@@ -126,7 +139,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             args.hashfile,
             append=True,
             algorithm=args.algorithm,
-            show_progress=show_progress
+            show_progress=show_progress,
+            parallel=args.parallel,
+            workers=args.workers
         )
     elif args.update:
         print(f"Updating {args.algorithm} hashes...")
@@ -134,7 +149,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             args.hashfile,
             update=True,
             algorithm=args.algorithm,
-            show_progress=show_progress
+            show_progress=show_progress,
+            parallel=args.parallel,
+            workers=args.workers
         )
     elif args.compare:
         filehasher.compare(args.hashfile, args.compare)

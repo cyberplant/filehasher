@@ -7,12 +7,21 @@ import time
 import configparser
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     from tqdm import tqdm
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+
+try:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
+    from rich.console import Console
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
 
 BLOCKSIZE = 1024 * 1024
 SCRIPT_FILENAME = "filehasher_script.sh"
@@ -30,6 +39,34 @@ SUPPORTED_ALGORITHMS = {
 
 DEFAULT_ALGORITHM = 'md5'
 CONFIG_FILE = '.filehasher.ini'
+
+
+def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool]) -> Tuple[str, str, str, str, str, str]:
+    """
+    Worker function for parallel file processing.
+    Returns (hashkey, hexdigest, subdir, filename, file_size, file_inode)
+    """
+    subdir, filename, full_filename, algorithm, update, append = file_info
+
+    if os.path.islink(full_filename):
+        return None  # Skip symlinks
+
+    file_stat = os.stat(full_filename)
+    file_size = file_stat.st_size
+    file_inode = file_stat.st_ino
+
+    key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+    hashkey = _get_hash(key, algorithm)
+
+    try:
+        with open(full_filename, "rb") as f:
+            hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+        hexdigest = hashsum.hexdigest()
+    except Exception as e:
+        print(f"Error processing {full_filename}: {e}")
+        return None
+
+    return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode)
 
 
 def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
@@ -167,7 +204,8 @@ def save_config(config_dict: Dict[str, Any]) -> None:
 
 
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
-                   algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> None:
+                   algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True,
+                   parallel: bool = False, workers: Optional[int] = None) -> None:
     """Generate hash file for all files in current directory tree."""
     cache = {}
     existing_algorithm = None
@@ -215,64 +253,155 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             full_filename = os.path.join(subdir, filename)
             if os.path.islink(full_filename):
                 continue
-            all_files.append((subdir, filename))
+            all_files.append((subdir, filename, full_filename))
 
-    # Use tqdm if available and progress is enabled
-    if show_progress and HAS_TQDM:
-        progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+    # Determine number of workers
+    if parallel:
+        if workers is None:
+            workers = min(mp.cpu_count(), len(all_files)) if len(all_files) > 0 else 1
+        else:
+            workers = min(workers, len(all_files)) if len(all_files) > 0 else 1
     else:
-        progress_bar = None
+        workers = 1
 
-    processed_count = 0
+    # Use Rich progress bars for parallel processing
+    if parallel and show_progress and HAS_RICH:
+        console = Console()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("({task.completed}/{task.total})"),
+            console=console,
+            refresh_per_second=10,
+        ) as progress:
+            main_task = progress.add_task("Processing files", total=len(all_files))
 
-    for subdir, dirs, files in os.walk("."):
-        if not files:
-            continue
-        if subdir == ".uma":
-            continue
-        if ".uma" in dirs:
-            dirs.remove(".uma")
+            # Process files in parallel
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                # Submit all file processing tasks
+                future_to_file = {}
+                for subdir, filename, full_filename in all_files:
+                    file_info = (subdir, filename, full_filename, algorithm, str(update), str(append))
+                    future = executor.submit(_process_file_worker, file_info)
+                    future_to_file[future] = (subdir, filename, full_filename)
 
-        for filename in files:
-            if subdir == "." and (filename == hash_file or filename == new_hash_file):
-                continue
-            full_filename = os.path.join(subdir, filename)
+                # Process completed tasks
+                for future in as_completed(future_to_file):
+                    subdir, filename, full_filename = future_to_file[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            hashkey, hexdigest, subdir, filename, file_size, file_inode = result
+                            filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
-            if os.path.islink(full_filename):
-                continue
+                            if hashkey in cache:
+                                if update:
+                                    cache_data = cache.pop(hashkey)
+                                    output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                    outfile.write(output + "\n")
+                            else:
+                                output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
+                                outfile.write(output + "\n")
 
-            file_stat = os.stat(full_filename)
-            file_size = file_stat.st_size
-            file_inode = file_stat.st_ino
+                    except Exception as e:
+                        print(f"Error processing {full_filename}: {e}")
 
-            key = f"{full_filename}{file_size}{file_stat.st_mtime}"
-            hashkey = _get_hash(key, algorithm)
-            filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                    progress.update(main_task, advance=1)
 
-            if hashkey in cache:
-                if update:
-                    cache_data = cache.pop(hashkey)
-                    output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
-                    outfile.write(output + "\n")
-            else:
+    elif parallel and show_progress and HAS_TQDM:
+        # Fallback to tqdm for parallel processing
+        progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_file = {}
+            for subdir, filename, full_filename in all_files:
+                file_info = (subdir, filename, full_filename, algorithm, str(update), str(append))
+                future = executor.submit(_process_file_worker, file_info)
+                future_to_file[future] = (subdir, filename, full_filename)
+
+            for future in as_completed(future_to_file):
+                subdir, filename, full_filename = future_to_file[future]
                 try:
-                    with open(full_filename, "rb") as f:
-                        hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+                    result = future.result()
+                    if result:
+                        hashkey, hexdigest, subdir, filename, file_size, file_inode = result
+                        filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+
+                        if hashkey in cache:
+                            if update:
+                                cache_data = cache.pop(hashkey)
+                                output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                outfile.write(output + "\n")
+                        else:
+                            output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
+                            outfile.write(output + "\n")
+
                 except Exception as e:
                     print(f"Error processing {full_filename}: {e}")
-                    if progress_bar:
-                        progress_bar.update(1)
-                    continue
 
-                output = f"{hashkey}|{hashsum.hexdigest()}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
-                outfile.write(output + "\n")
-
-            processed_count += 1
-            if progress_bar:
                 progress_bar.update(1)
 
-    if progress_bar:
         progress_bar.close()
+
+    else:
+        # Sequential processing (original logic)
+        if show_progress and HAS_TQDM and not parallel:
+            progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+        else:
+            progress_bar = None
+
+        processed_count = 0
+
+        for subdir, dirs, files in os.walk("."):
+            if not files:
+                continue
+            if subdir == ".uma":
+                continue
+            if ".uma" in dirs:
+                dirs.remove(".uma")
+
+            for filename in files:
+                if subdir == "." and (filename == hash_file or filename == new_hash_file):
+                    continue
+                full_filename = os.path.join(subdir, filename)
+
+                if os.path.islink(full_filename):
+                    continue
+
+                file_stat = os.stat(full_filename)
+                file_size = file_stat.st_size
+                file_inode = file_stat.st_ino
+
+                key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+                hashkey = _get_hash(key, algorithm)
+                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+
+                if hashkey in cache:
+                    if update:
+                        cache_data = cache.pop(hashkey)
+                        output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                        outfile.write(output + "\n")
+                else:
+                    try:
+                        with open(full_filename, "rb") as f:
+                            hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+                    except Exception as e:
+                        print(f"Error processing {full_filename}: {e}")
+                        if progress_bar:
+                            progress_bar.update(1)
+                        continue
+
+                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
+                    outfile.write(output + "\n")
+
+                processed_count += 1
+                if progress_bar:
+                    progress_bar.update(1)
+
+        if progress_bar:
+            progress_bar.close()
 
     outfile.close()
     if update:
