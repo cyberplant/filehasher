@@ -5,7 +5,7 @@ import hashlib
 import sys
 import time
 import configparser
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -71,43 +71,38 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) 
     return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename
 
 
-def _process_single_file_worker(file_queue, algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int) -> List[Tuple]:
+def _collect_files(hash_file: str, collect_paths: bool = False) -> Union[int, List[Tuple[str, str, str]]]:
     """
-    Process individual files from a queue for a single worker.
-    This function runs in a separate process.
+    Collect files from current directory for processing.
+
+    Args:
+        hash_file: Name of the hash file to exclude
+        collect_paths: If True, return list of (subdir, filename, full_filename)
+                      If False, return count of files only
+
+    Returns:
+        If collect_paths is False: total file count (int)
+        If collect_paths is True: list of file tuples
     """
-    results = []
+    result = [] if collect_paths else 0
 
-    while True:
-        file_info = file_queue.get()
-        if file_info is None:  # End signal
-            break
-
-        subdir, filename, full_filename = file_info
-
-        if os.path.islink(full_filename):
+    for subdir, dirs, files in os.walk("."):
+        if subdir == ".uma":
             continue
+        if ".uma" in dirs:
+            dirs.remove(".uma")
 
-        file_stat = os.stat(full_filename)
-        file_size = file_stat.st_size
-        file_inode = file_stat.st_ino
+        for filename in files:
+            if subdir == "." and (filename == hash_file or filename == hash_file + ".new"):
+                continue
+            full_filename = os.path.join(subdir, filename)
+            if not os.path.islink(full_filename):
+                if collect_paths:
+                    result.append((subdir, filename, full_filename))
+                else:
+                    result += 1
 
-        key = f"{full_filename}{file_size}{file_stat.st_mtime}"
-        hashkey = _get_hash(key, algorithm)
-
-        processed_filename = full_filename if verbose else None
-
-        try:
-            with open(full_filename, "rb") as f:
-                hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
-            hexdigest = hashsum.hexdigest()
-
-            results.append((hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename))
-        except Exception as e:
-            print(f"Error processing {full_filename}: {e}")
-            continue
-
-    return results
+    return result
 
 
 def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int) -> List[Tuple]:
@@ -315,19 +310,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             outfile.write(f"# Algorithm: {algorithm}\n")
 
     # Count total files first for progress tracking (much faster than collecting all)
-    total_files = 0
-    for subdir, dirs, files in os.walk("."):
-        if subdir == ".uma":
-            continue
-        if ".uma" in dirs:
-            dirs.remove(".uma")
-
-        for filename in files:
-            if subdir == "." and (filename == hash_file or filename == new_hash_file):
-                continue
-            full_filename = os.path.join(subdir, filename)
-            if not os.path.islink(full_filename):
-                total_files += 1
+    total_files = _collect_files(hash_file, collect_paths=False)
 
 
     # Determine number of workers
@@ -369,20 +352,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
             # Process files on-the-fly with parallel workers using shared list
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Collect all files first but in a more efficient way
-                all_files = []
-                for subdir, dirs, files in os.walk("."):
-                    if subdir == ".uma":
-                        continue
-                    if ".uma" in dirs:
-                        dirs.remove(".uma")
-
-                    for filename in files:
-                        if subdir == "." and (filename == hash_file or filename == new_hash_file):
-                            continue
-                        full_filename = os.path.join(subdir, filename)
-                        if not os.path.islink(full_filename):
-                            all_files.append((subdir, filename, full_filename))
+                # Collect all files for processing
+                all_files = _collect_files(hash_file, collect_paths=True)
 
                 # Distribute files among workers more evenly
                 files_per_worker = len(all_files) // workers
@@ -443,19 +414,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
 
         # Collect all files for tqdm implementation
-        all_files = []
-        for subdir, dirs, files in os.walk("."):
-            if subdir == ".uma":
-                continue
-            if ".uma" in dirs:
-                dirs.remove(".uma")
-
-            for filename in files:
-                if subdir == "." and (filename == hash_file or filename == new_hash_file):
-                    continue
-                full_filename = os.path.join(subdir, filename)
-                if not os.path.islink(full_filename):
-                    all_files.append((subdir, filename, full_filename))
+        all_files = _collect_files(hash_file, collect_paths=True)
 
         # Distribute files among workers
         files_per_worker = len(all_files) // workers
