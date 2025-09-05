@@ -329,6 +329,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             if not os.path.islink(full_filename):
                 total_files += 1
 
+
     # Determine number of workers
     if parallel:
         if workers is None:
@@ -353,11 +354,18 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             console=console,
             refresh_per_second=10,
         ) as progress:
-            # Create progress tasks for each worker
+            # Create progress tasks for each worker with correct totals
             worker_tasks = []
+            files_per_worker = total_files // workers
+            extra_files = total_files % workers
+
             for i in range(workers):
-                task = progress.add_task(f"Worker {i+1}", total=total_files // workers, filename="")
+                worker_total = files_per_worker
+                if i < extra_files:
+                    worker_total += 1
+                task = progress.add_task(f"Worker {i+1}", total=worker_total, filename="")
                 worker_tasks.append(task)
+
 
             # Process files on-the-fly with parallel workers using shared list
             with ProcessPoolExecutor(max_workers=workers) as executor:
