@@ -1,308 +1,455 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import os
 import hashlib
 import sys
+import time
+import configparser
+from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 BLOCKSIZE = 1024 * 1024
 SCRIPT_FILENAME = "filehasher_script.sh"
-repeated = {}
+repeated: Dict[str, List] = {}
+
+# Supported hash algorithms
+SUPPORTED_ALGORITHMS = {
+    'md5': hashlib.md5,
+    'sha1': hashlib.sha1,
+    'sha256': hashlib.sha256,
+    'sha512': hashlib.sha512,
+    'blake2b': hashlib.blake2b,
+    'blake2s': hashlib.blake2s,
+}
+
+DEFAULT_ALGORITHM = 'md5'
+CONFIG_FILE = '.filehasher.ini'
 
 
-def _getMD5(s):
-    return hashlib.md5(s.encode("utf-8", "surrogateescape")).hexdigest()
+def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
+    """Generate hash for a string using specified algorithm."""
+    hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
+    return hash_func(s.encode("utf-8", "surrogateescape")).hexdigest()
 
 
-def calculate_md5(f):
-    md5sum = hashlib.md5()
+def calculate_hash(f, algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> Tuple[Any, bool]:
+    """Calculate hash for a file using specified algorithm."""
+    hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
+    hashsum = hash_func()
     readcount = 0
     dirty = False
-    while 1:
+
+    while True:
         block = f.read(BLOCKSIZE)
         if not block:
             break
-        readcount = readcount + 1
-        if readcount > 10 and readcount % 23 == 0:
+        readcount += 1
+        if show_progress and readcount > 10 and readcount % 23 == 0:
             if dirty:
                 sys.stdout.write("\b")
             dirty = True
-            sys.stdout.write(("/", "|", '\\', "-")[readcount % 4])
+            sys.stdout.write(("/", "|", "\\", "-")[readcount % 4])
             sys.stdout.flush()
-        md5sum.update(block)
+        hashsum.update(block)
 
-    return md5sum, dirty
+    return hashsum, dirty
 
 
-def generate_hashes(hash_file, update=False, append=False):
+# Backward compatibility
+def _getMD5(s):
+    return _get_hash(s, 'md5')
+
+
+def calculate_md5(f):
+    return calculate_hash(f, 'md5')
+
+
+def benchmark_algorithms(test_file: str = None, algorithms: List[str] = None,
+                        iterations: int = 3) -> Dict[str, Dict[str, float]]:
+    """
+    Benchmark different hash algorithms on a test file or sample data.
+
+    Returns a dictionary with algorithm names as keys and performance metrics as values.
+    """
+    if algorithms is None:
+        algorithms = list(SUPPORTED_ALGORITHMS.keys())
+
+    if test_file and os.path.exists(test_file):
+        print(f"Benchmarking algorithms using file: {test_file}")
+        with open(test_file, "rb") as f:
+            test_data = f.read()
+    else:
+        # Use sample data if no test file provided
+        test_data = b"x" * (10 * 1024 * 1024)  # 10MB of data
+        print("Benchmarking algorithms using 10MB sample data")
+
+    results = {}
+
+    for algorithm in algorithms:
+        if algorithm not in SUPPORTED_ALGORITHMS:
+            print(f"Warning: Unsupported algorithm '{algorithm}', skipping")
+            continue
+
+        times = []
+        print(f"Testing {algorithm}...")
+
+        for i in range(iterations):
+            start_time = time.time()
+            hash_func = SUPPORTED_ALGORITHMS[algorithm]
+            hasher = hash_func()
+
+            # Process data in chunks to simulate real file processing
+            for i in range(0, len(test_data), BLOCKSIZE):
+                chunk = test_data[i:i + BLOCKSIZE]
+                hasher.update(chunk)
+
+            end_time = time.time()
+            times.append(end_time - start_time)
+
+        avg_time = sum(times) / len(times)
+        results[algorithm] = {
+            'average_time': avg_time,
+            'min_time': min(times),
+            'max_time': max(times),
+            'throughput_mb_per_sec': (len(test_data) / (1024 * 1024)) / avg_time
+        }
+
+    return results
+
+
+def load_config() -> Dict[str, Any]:
+    """
+    Load configuration from .filehasher.ini file.
+
+    Returns a dictionary with configuration values.
+    """
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+
+    if not config.has_section('filehasher'):
+        config.add_section('filehasher')
+
+    # Set defaults if not present
+    if not config.has_option('filehasher', 'default_algorithm'):
+        config.set('filehasher', 'default_algorithm', DEFAULT_ALGORITHM)
+
+    if not config.has_option('filehasher', 'benchmark_iterations'):
+        config.set('filehasher', 'benchmark_iterations', '3')
+
+    if not config.has_option('filehasher', 'quiet'):
+        config.set('filehasher', 'quiet', 'false')
+
+    return {
+        'default_algorithm': config.get('filehasher', 'default_algorithm'),
+        'benchmark_iterations': config.getint('filehasher', 'benchmark_iterations'),
+        'quiet': config.getboolean('filehasher', 'quiet'),
+    }
+
+
+def save_config(config_dict: Dict[str, Any]) -> None:
+    """
+    Save configuration to .filehasher.ini file.
+    """
+    config = configparser.ConfigParser()
+    config.add_section('filehasher')
+
+    for key, value in config_dict.items():
+        config.set('filehasher', str(key), str(value))
+
+    with open(CONFIG_FILE, 'w') as configfile:
+        config.write(configfile)
+
+
+def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
+                   algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> None:
+    """Generate hash file for all files in current directory tree."""
     cache = {}
+    existing_algorithm = None
+
     if (append or update) and os.path.exists(hash_file):
-        _load_hashfile(hash_file, cache_data=cache)
+        _, existing_algorithm = _load_hashfile(hash_file, cache_data=cache)
+
+        # Check for algorithm mismatch
+        if existing_algorithm and existing_algorithm != algorithm:
+            print(f"⚠️  WARNING: Algorithm mismatch detected!")
+            print(f"   Existing hash file uses: {existing_algorithm}")
+            print(f"   Requested algorithm: {algorithm}")
+            print(f"   This may cause inconsistent hash comparisons.")
+            response = input("   Continue anyway? (y/N): ").strip().lower()
+            if response not in ('y', 'yes'):
+                print("   Operation cancelled.")
+                return
 
     new_hash_file = hash_file + ".new"
 
     if update:
-        # Create a new file with only needed hashes
+        # Create a new file with algorithm header and only needed hashes
         outfile = _asserted_open(new_hash_file, "w")
+        outfile.write(f"# Algorithm: {algorithm}\n")
     else:
         if append:
             # Only appends new hashes
             outfile = _asserted_open(hash_file, "a")
         else:
-            # Create a new file
+            # Create a new file with algorithm header
             outfile = _asserted_open(hash_file, "w")
+            outfile.write(f"# Algorithm: {algorithm}\n")
+
+    # Collect all files first for progress tracking
+    all_files = []
+    for subdir, dirs, files in os.walk("."):
+        if subdir == ".uma":
+            continue
+        if ".uma" in dirs:
+            dirs.remove(".uma")
+
+        for filename in files:
+            if subdir == "." and (filename == hash_file or filename == new_hash_file):
+                continue
+            full_filename = os.path.join(subdir, filename)
+            if os.path.islink(full_filename):
+                continue
+            all_files.append((subdir, filename))
+
+    # Use tqdm if available and progress is enabled
+    if show_progress and HAS_TQDM:
+        progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+    else:
+        progress_bar = None
+
+    processed_count = 0
 
     for subdir, dirs, files in os.walk("."):
         if not files:
             continue
-        sys.stdout.write(subdir + " -> ")
         if subdir == ".uma":
-            sys.stdout.write("Ignored")
             continue
-        if dirs.count(".uma") > 0:
+        if ".uma" in dirs:
             dirs.remove(".uma")
+
         for filename in files:
-            if subdir == "." and (filename == hash_file or
-                                  filename == new_hash_file):
+            if subdir == "." and (filename == hash_file or filename == new_hash_file):
                 continue
-            full_filename = subdir + "/" + filename
+            full_filename = os.path.join(subdir, filename)
 
             if os.path.islink(full_filename):
-                # Don't process symlinks
                 continue
 
             file_stat = os.stat(full_filename)
             file_size = file_stat.st_size
             file_inode = file_stat.st_ino
 
-            key = (full_filename +
-                   str(file_stat.st_size) +
-                   str(file_stat.st_mtime))
-            md5key = _getMD5(key)
-            filename = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+            key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+            hashkey = _get_hash(key, algorithm)
+            filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
-            if md5key in cache:
-                sys.stdout.write("C")
+            if hashkey in cache:
                 if update:
-                    cache_data = cache.pop(md5key)
-                    output = "%s|%s|%s|%s|%s|%s" % (md5key, cache_data[0],
-                                                    subdir, filename,
-                                                    cache_data[3],
-                                                    cache_data[4])
+                    cache_data = cache.pop(hashkey)
+                    output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
                     outfile.write(output + "\n")
             else:
-
-                f = open(full_filename, "rb")
                 try:
-                    md5sum, dirty = calculate_md5(f)
+                    with open(full_filename, "rb") as f:
+                        hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
                 except Exception as e:
-                    print("Error:", e)
+                    print(f"Error processing {full_filename}: {e}")
+                    if progress_bar:
+                        progress_bar.update(1)
                     continue
-                f.close()
-                output = "%s|%s|%s|%s|%d|%d" % (md5key,
-                                                md5sum.hexdigest(),
-                                                subdir, filename, file_size,
-                                                file_inode)
+
+                output = f"{hashkey}|{hashsum.hexdigest()}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                 outfile.write(output + "\n")
-                if dirty:
-                    sys.stdout.write("\b")
-                sys.stdout.write(".")
-            sys.stdout.flush()
-        sys.stdout.write("\n")
+
+            processed_count += 1
+            if progress_bar:
+                progress_bar.update(1)
+
+    if progress_bar:
+        progress_bar.close()
+
     outfile.close()
     if update:
         os.rename(new_hash_file, hash_file)
-        if len(cache) > 0:
-            print("%d old cache entries cleaned." % len(cache))
+        if cache:
+            print(f"{len(cache)} old cache entries cleaned.")
             for key in cache:
                 cache_data = cache[key]
-                print(key + " -> " + cache_data[1] + "/" + cache_data[2])
+                print(f"{key} -> {cache_data[1]}/{cache_data[2]}")
 
 
-def _load_hashfile(filename, destDict=None, cache_data=None):
+def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
+                   cache_data: Optional[Dict] = None) -> Tuple[Dict, Optional[str]]:
+    """Load hash file and populate destination dictionary. Returns (dict, algorithm)."""
     f = _asserted_open(filename, "r")
 
     if destDict is None:
         destDict = {}
 
-    while 1:
-        line = f.readline()
+    algorithm = None
+
+    for line in f:
+        line = line.rstrip()
         if not line:
-            break
-        line = line[0:len(line) - 1]
-        key, md5sum, dirname, filename, file_size, file_inode = line.split("|")
+            continue
+
+        # Check for algorithm header
+        if line.startswith("# Algorithm: "):
+            algorithm = line[13:].strip()
+            continue
+
+        key, hashsum, dirname, filename, file_size, file_inode = line.split("|")
         fileinfo = (dirname, filename, file_size, file_inode)
 
-        if md5sum in destDict:
-            if md5sum in repeated:
-                repeated[md5sum].append(fileinfo)
+        if hashsum in destDict:
+            if hashsum in repeated:
+                repeated[hashsum].append(fileinfo)
             else:
-                repeated[md5sum] = []
-                repeated[md5sum].append(fileinfo)
-                repeated[md5sum].append(destDict[md5sum])
+                repeated[hashsum] = [destDict[hashsum], fileinfo]
 
-        destDict[md5sum] = fileinfo
+        destDict[hashsum] = fileinfo
 
         if cache_data is not None:
-            cache_data[key] = (md5sum, dirname, filename,
-                               file_size, file_inode)
+            cache_data[key] = (hashsum, dirname, filename, file_size, file_inode)
 
     f.close()
+    return destDict, algorithm
 
-    return destDict
 
-
-def compare(md5file1, md5file2):
+def compare(hashfile1: str, hashfile2: Optional[str] = None) -> None:
+    """Compare two hash files and generate synchronization commands."""
     global output_file
-
     output_file = None
 
-    md5a = _load_hashfile(md5file1)
-    md5b = []
-    if md5file2:
-        md5b = _load_hashfile(md5file2)
+    hash_a, _ = _load_hashfile(hashfile1)
+    hash_b = {}
+    if hashfile2:
+        hash_b, _ = _load_hashfile(hashfile2)
 
     commands = []
     mkdirs = set()
     rmdirs = set()
-    onlyIn1 = {}
-    i = 0
-    for hashmd5 in md5a:
-        fdata1 = md5a[hashmd5]
+    only_in_1 = {}
+
+    for hash_val in hash_a:
+        fdata1 = hash_a[hash_val]
         fdata2 = None
 
-        if hashmd5 in md5b:
-            fdata2 = md5b[hashmd5]
-            md5b.pop(hashmd5)
+        if hash_val in hash_b:
+            fdata2 = hash_b[hash_val]
+            hash_b.pop(hash_val)
         else:
-            onlyIn1[hashmd5] = fdata1
+            only_in_1[hash_val] = fdata1
             continue
 
         if fdata2[0] == fdata1[0] and fdata2[1] == fdata1[1]:
             # The files are the same
             continue
         else:
-            print("Different: ", fdata1, fdata2)
+            print(f"Different: {fdata1} vs {fdata2}")
             if fdata1[0] == fdata2[0]:
                 # Same directory, only filename changed
-                commands.append("mv -v '%s/%s' '%s/%s'" % (fdata1[0],
-                                                           fdata1[1],
-                                                           fdata2[0],
-                                                           fdata2[1]))
+                commands.append(f"mv -v '{fdata1[0]}/{fdata1[1]}' '{fdata2[0]}/{fdata2[1]}'")
             else:
                 # Directory changed and possibly filename too
-                mkdirs.add("mkdir -pv '%s'" % fdata2[0])
+                mkdirs.add(f"mkdir -pv '{fdata2[0]}'")
                 if fdata1[0] != ".":
-                    rmdirs.add("rmdir -v '%s'" % fdata1[0])
+                    rmdirs.add(f"rmdir -v '{fdata1[0]}'")
 
-                commands.append("mv -v '%s/%s' '%s/%s'" % (fdata1[0],
-                                                           fdata1[1],
-                                                           fdata2[0],
-                                                           fdata2[1]))
+                commands.append(f"mv -v '{fdata1[0]}/{fdata1[1]}' '{fdata2[0]}/{fdata2[1]}'")
 
-    if md5file2:
-        if onlyIn1:
-            print("\n# Those files only exist in", md5file1)
-
-            for item in _sorted_filenames(onlyIn1):
+    if hashfile2:
+        if only_in_1:
+            print(f"\n# Those files only exist in {hashfile1}")
+            for item in _sorted_filenames(only_in_1):
                 print(item)
 
-        if md5b:
-            print("\n# Those files only exist in", md5file2)
-
-            for item in _sorted_filenames(md5b):
+        if hash_b:
+            print(f"\n# Those files only exist in {hashfile2}")
+            for item in _sorted_filenames(hash_b):
                 print(item)
 
     if commands:
         tee(output_file, "\n# Commands to execute in console:")
 
-        mkdirs_list = list(mkdirs)
-        rmdirs_list = list(rmdirs)
-
-        mkdirs_list.sort()
-        rmdirs_list.sort()
-        rmdirs_list.reverse()
-        commands.sort()
+        mkdirs_list = sorted(list(mkdirs))
+        rmdirs_list = sorted(list(rmdirs), reverse=True)
+        commands_sorted = sorted(commands)
 
         tee(output_file, "\n# mkdir statements.\n")
-        for i in mkdirs_list:
-            tee(output_file, i)
+        for cmd in mkdirs_list:
+            tee(output_file, cmd)
 
         tee(output_file, "\n# mv statements.\n")
-        for i in commands:
-            tee(output_file, i)
+        for cmd in commands_sorted:
+            tee(output_file, cmd)
 
-        tee(output_file, "\n# Directories possibly empty from now. " +
-                         "Please check.\n")
-        for i in rmdirs_list:
-            tee(output_file, "#" + i)
+        tee(output_file, "\n# Directories possibly empty from now. Please check.\n")
+        for cmd in rmdirs_list:
+            tee(output_file, f"#{cmd}")
 
     if repeated:
         tee(output_file, """
-# Those files are repeated. You can remove one or many of them if you wish:")
+# Those files are repeated. You can remove one or many of them if you wish.
 # (Note: if the inode is the same, there is no space wasted)
 """)
         filenames = []
         for item in repeated:
-            filenames += [(l[0], l[1], item) for l in repeated[item]]
+            filenames.extend([(l[0], l[1], item) for l in repeated[item]])
 
         filenames.sort()
 
-        while len(filenames) > 0:
+        while filenames:
             item = filenames.pop(0)
             item_key = item[2]
 
             if item_key in repeated:
                 repeated_files = repeated.pop(item_key)
-                tee(output_file, "\n# Key: {key} - Size: {filesize}".format(
-                    key=item_key,
-                    filesize=repeated_files[0][2]
-                ))
+                tee(output_file, f"\n# Key: {item_key} - Size: {repeated_files[0][2]}")
 
-                c = set()
-
+                commands_set = set()
                 for repeated_file in repeated_files:
-                    c.add("# rm '{dirname}/{fname}' # inode: {inode}".format(
-                        dirname=repeated_file[0],
-                        fname=repeated_file[1],
-                        inode=repeated_file[3],
-                    ))
+                    commands_set.add(f"# rm '{repeated_file[0]}/{repeated_file[1]}' # inode: {repeated_file[3]}")
 
-                commands = list(c)
-                commands.sort()
-                tee(output_file, "\n".join(commands))
+                commands_list = sorted(list(commands_set))
+                tee(output_file, "\n".join(commands_list))
 
     if output_file is not None:
         output_file.close()
 
 
-def _sorted_filenames(filelist):
-    filenames = ["/".join((filelist[item][0], filelist[item][1]))
+def _sorted_filenames(filelist: Dict) -> List[str]:
+    """Sort filenames from file list dictionary."""
+    filenames = [os.path.join(filelist[item][0], filelist[item][1])
                  for item in filelist]
     filenames.sort()
     return filenames
 
 
-def tee(o, s):
+def tee(o: Optional[Any], s: str) -> None:
+    """Write to file and print to stdout."""
+    global output_file
     if o is None:
         o = open(SCRIPT_FILENAME, "w")
-
-        global output_file
         output_file = o
 
     o.write(s + "\n")
     print(s)
 
 
-def _asserted_open(filename, mode):
-    f = None
+def _asserted_open(filename: str, mode: str) -> Any:
+    """Open file with error handling."""
     try:
-        f = open(filename, mode)
+        return open(filename, mode)
     except IOError as e:
-        print("I/O Error:", e)
-
+        print(f"I/O Error: {e}")
         sys.exit(2)
     except Exception as e:
-        print("Error:", e)
+        print(f"Error: {e}")
         raise e
-
-    return f
