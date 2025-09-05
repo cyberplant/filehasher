@@ -4,6 +4,7 @@ import filehasher
 import sys
 import argparse
 from typing import List
+from filehasher.version import __version__
 
 
 def main():
@@ -12,6 +13,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  %(prog)s --version
   %(prog)s --generate --algorithm sha256
   %(prog)s --benchmark
   %(prog)s --compare other.hashes
@@ -82,6 +84,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
     parser.add_argument('--verbose', '-v', action='store_true',
                         dest="verbose",
                         help="Show detailed progress including filenames being processed")
+
+    parser.add_argument('--version', '-V', action='version', version=__version__,
+                        help="Show version information")
 
     parser.add_argument('hashfile', default='.hashes', nargs='?',
                         help="Hashes file. Default filename: %(default)s")

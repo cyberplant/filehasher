@@ -1,7 +1,10 @@
 from setuptools import setup
 
+# Read version from filehasher/version.py
+exec(open('filehasher/version.py').read())
+
 setup(name='filehasher',
-      version='1.0.0',
+      version=__version__,
       description='Modern file hashing utility with parallel processing, multiple algorithms, and benchmarking',
       url='http://github.com/cyberplant/filehasher',
       author='Luar Roji',
