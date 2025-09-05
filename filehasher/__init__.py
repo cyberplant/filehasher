@@ -41,12 +41,12 @@ DEFAULT_ALGORITHM = 'md5'
 CONFIG_FILE = '.filehasher.ini'
 
 
-def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool]) -> Tuple[str, str, str, str, str, str]:
+def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) -> Tuple[str, str, str, str, str, str, Optional[str]]:
     """
     Worker function for parallel file processing.
-    Returns (hashkey, hexdigest, subdir, filename, file_size, file_inode)
+    Returns (hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename)
     """
-    subdir, filename, full_filename, algorithm, update, append = file_info
+    subdir, filename, full_filename, algorithm, update, append, verbose = file_info
 
     if os.path.islink(full_filename):
         return None  # Skip symlinks
@@ -58,6 +58,8 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool]) -> Tup
     key = f"{full_filename}{file_size}{file_stat.st_mtime}"
     hashkey = _get_hash(key, algorithm)
 
+    processed_filename = full_filename if verbose else None
+
     try:
         with open(full_filename, "rb") as f:
             hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
@@ -66,7 +68,7 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool]) -> Tup
         print(f"Error processing {full_filename}: {e}")
         return None
 
-    return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode)
+    return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename
 
 
 def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
@@ -205,7 +207,8 @@ def save_config(config_dict: Dict[str, Any]) -> None:
 
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                    algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True,
-                   parallel: bool = False, workers: Optional[int] = None) -> None:
+                   parallel: bool = False, workers: Optional[int] = None,
+                   verbose: bool = False) -> None:
     """Generate hash file for all files in current directory tree."""
     cache = {}
     existing_algorithm = None
@@ -264,36 +267,63 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
     else:
         workers = 1
 
-    # Use Rich progress bars for parallel processing
+    # Use Rich progress bars for parallel processing with individual worker progress
     if parallel and show_progress and HAS_RICH:
         console = Console()
+
+        # Create individual progress bars for each worker
         with Progress(
             SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
+            TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TextColumn("({task.completed}/{task.total})"),
+            TextColumn("[dim]{task.fields[filename]}"),
             console=console,
-            refresh_per_second=10,
+            refresh_per_second=4,
         ) as progress:
-            main_task = progress.add_task("Processing files", total=len(all_files))
+            # Create progress tasks for each worker
+            worker_tasks = []
+            for i in range(workers):
+                task = progress.add_task(f"Worker {i+1}", total=0, filename="")
+                worker_tasks.append(task)
+
+            # Distribute files among workers
+            files_per_worker = len(all_files) // workers
+            extra_files = len(all_files) % workers
+
+            worker_file_lists = []
+            start_idx = 0
+            for i in range(workers):
+                worker_files = files_per_worker
+                if i < extra_files:
+                    worker_files += 1
+                end_idx = start_idx + worker_files
+                worker_file_lists.append(all_files[start_idx:end_idx])
+                start_idx = end_idx
 
             # Process files in parallel
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Submit all file processing tasks
-                future_to_file = {}
-                for subdir, filename, full_filename in all_files:
-                    file_info = (subdir, filename, full_filename, algorithm, str(update), str(append))
-                    future = executor.submit(_process_file_worker, file_info)
-                    future_to_file[future] = (subdir, filename, full_filename)
+                # Submit tasks for each worker
+                future_to_worker = {}
+                for worker_id, worker_files in enumerate(worker_file_lists):
+                    if worker_files:  # Only create task if worker has files
+                        progress.update(worker_tasks[worker_id], total=len(worker_files))
+
+                        # Submit all files for this worker
+                        for subdir, filename, full_filename in worker_files:
+                            file_info = (subdir, filename, full_filename, algorithm, str(update), str(append), verbose)
+                            future = executor.submit(_process_file_worker, file_info)
+                            future_to_worker[future] = (worker_id, subdir, filename, full_filename)
 
                 # Process completed tasks
-                for future in as_completed(future_to_file):
-                    subdir, filename, full_filename = future_to_file[future]
+                worker_completed = [0] * workers
+                for future in as_completed(future_to_worker):
+                    worker_id, subdir, filename, full_filename = future_to_worker[future]
                     try:
                         result = future.result()
                         if result:
-                            hashkey, hexdigest, subdir, filename, file_size, file_inode = result
+                            hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
                             filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                             if hashkey in cache:
@@ -305,19 +335,29 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                                 outfile.write(output + "\n")
 
+                            # Update progress with current filename if verbose
+                            if verbose and processed_filename:
+                                progress.update(worker_tasks[worker_id],
+                                              advance=1,
+                                              filename=os.path.basename(processed_filename))
+                            else:
+                                progress.update(worker_tasks[worker_id], advance=1)
+
                     except Exception as e:
                         print(f"Error processing {full_filename}: {e}")
-
-                    progress.update(main_task, advance=1)
+                        progress.update(worker_tasks[worker_id], advance=1)
 
     elif parallel and show_progress and HAS_TQDM:
         # Fallback to tqdm for parallel processing
-        progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+        if verbose:
+            progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+        else:
+            progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             future_to_file = {}
             for subdir, filename, full_filename in all_files:
-                file_info = (subdir, filename, full_filename, algorithm, str(update), str(append))
+                file_info = (subdir, filename, full_filename, algorithm, str(update), str(append), verbose)
                 future = executor.submit(_process_file_worker, file_info)
                 future_to_file[future] = (subdir, filename, full_filename)
 
@@ -326,7 +366,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 try:
                     result = future.result()
                     if result:
-                        hashkey, hexdigest, subdir, filename, file_size, file_inode = result
+                        hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
                         filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                         if hashkey in cache:
@@ -337,6 +377,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         else:
                             output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                             outfile.write(output + "\n")
+
+                        # Show filename if verbose
+                        if verbose and processed_filename:
+                            progress_bar.set_description(f"Processing: {os.path.basename(processed_filename)}")
 
                 except Exception as e:
                     print(f"Error processing {full_filename}: {e}")
