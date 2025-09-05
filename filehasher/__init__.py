@@ -406,8 +406,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                       filename=os.path.basename(filename) if verbose and filename else "")
                                     elif message[0] == 'done':
                                         worker_completed[message[1]] = True
-                                except:
-                                    # Queue empty, continue
+                                except Exception:
+                                    # Queue empty or other queue-related exception, continue
                                     pass
                             time.sleep(0.01)  # Small delay to avoid busy waiting
 
@@ -447,7 +447,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         try:
                             while not q.empty():
                                 q.get_nowait()
-                        except:
+                        except Exception:
                             pass
 
     elif parallel and show_progress and HAS_TQDM:
@@ -500,8 +500,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     progress_bar.update(advance)
                                 elif message[0] == 'done':
                                     worker_completed[message[1]] = True
-                            except:
-                                # Queue empty, continue
+                            except Exception:
+                                # Queue empty or other queue-related exception, continue
                                 pass
                         time.sleep(0.01)  # Small delay to avoid busy waiting
 
@@ -541,7 +541,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     try:
                         while not q.empty():
                             q.get_nowait()
-                    except:
+                    except Exception:
                         pass
 
         progress_bar.close()
