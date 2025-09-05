@@ -71,6 +71,45 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) 
     return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename
 
 
+def _process_single_file_worker(file_queue, algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int) -> List[Tuple]:
+    """
+    Process individual files from a queue for a single worker.
+    This function runs in a separate process.
+    """
+    results = []
+
+    while True:
+        file_info = file_queue.get()
+        if file_info is None:  # End signal
+            break
+
+        subdir, filename, full_filename = file_info
+
+        if os.path.islink(full_filename):
+            continue
+
+        file_stat = os.stat(full_filename)
+        file_size = file_stat.st_size
+        file_inode = file_stat.st_ino
+
+        key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+        hashkey = _get_hash(key, algorithm)
+
+        processed_filename = full_filename if verbose else None
+
+        try:
+            with open(full_filename, "rb") as f:
+                hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+            hexdigest = hashsum.hexdigest()
+
+            results.append((hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename))
+        except Exception as e:
+            print(f"Error processing {full_filename}: {e}")
+            continue
+
+    return results
+
+
 def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int) -> List[Tuple]:
     """
     Process a batch of files for a single worker.
@@ -275,8 +314,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             outfile = _asserted_open(hash_file, "w")
             outfile.write(f"# Algorithm: {algorithm}\n")
 
-    # Collect all files first for progress tracking
-    all_files = []
+    # Count total files first for progress tracking (much faster than collecting all)
+    total_files = 0
     for subdir, dirs, files in os.walk("."):
         if subdir == ".uma":
             continue
@@ -287,16 +326,15 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             if subdir == "." and (filename == hash_file or filename == new_hash_file):
                 continue
             full_filename = os.path.join(subdir, filename)
-            if os.path.islink(full_filename):
-                continue
-            all_files.append((subdir, filename, full_filename))
+            if not os.path.islink(full_filename):
+                total_files += 1
 
     # Determine number of workers
     if parallel:
         if workers is None:
-            workers = min(mp.cpu_count(), len(all_files)) if len(all_files) > 0 else 1
+            workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
         else:
-            workers = min(workers, len(all_files)) if len(all_files) > 0 else 1
+            workers = min(workers, total_files) if total_files > 0 else 1
     else:
         workers = 1
 
@@ -313,39 +351,53 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             TextColumn("({task.completed}/{task.total})"),
             TextColumn("[dim]{task.fields[filename]}"),
             console=console,
-            refresh_per_second=4,
+            refresh_per_second=10,
         ) as progress:
             # Create progress tasks for each worker
             worker_tasks = []
             for i in range(workers):
-                task = progress.add_task(f"Worker {i+1}", total=0, filename="")
+                task = progress.add_task(f"Worker {i+1}", total=total_files // workers, filename="")
                 worker_tasks.append(task)
 
-            # Distribute files among workers
-            files_per_worker = len(all_files) // workers
-            extra_files = len(all_files) % workers
-
-            worker_file_lists = []
-            start_idx = 0
-            for i in range(workers):
-                worker_files = files_per_worker
-                if i < extra_files:
-                    worker_files += 1
-                end_idx = start_idx + worker_files
-                worker_file_lists.append(all_files[start_idx:end_idx])
-                start_idx = end_idx
-
-            # Process files in parallel using worker batches
+            # Process files on-the-fly with parallel workers using shared list
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Submit batch tasks for each worker
+                # Collect all files first but in a more efficient way
+                all_files = []
+                for subdir, dirs, files in os.walk("."):
+                    if subdir == ".uma":
+                        continue
+                    if ".uma" in dirs:
+                        dirs.remove(".uma")
+
+                    for filename in files:
+                        if subdir == "." and (filename == hash_file or filename == new_hash_file):
+                            continue
+                        full_filename = os.path.join(subdir, filename)
+                        if not os.path.islink(full_filename):
+                            all_files.append((subdir, filename, full_filename))
+
+                # Distribute files among workers more evenly
+                files_per_worker = len(all_files) // workers
+                extra_files = len(all_files) % workers
+
+                worker_file_lists = []
+                start_idx = 0
+                for i in range(workers):
+                    worker_files = files_per_worker
+                    if i < extra_files:
+                        worker_files += 1
+                    end_idx = start_idx + worker_files
+                    worker_file_lists.append(all_files[start_idx:end_idx])
+                    start_idx = end_idx
+
+                # Submit all worker tasks at once
                 future_to_worker = {}
                 for worker_id, worker_files in enumerate(worker_file_lists):
                     if worker_files:  # Only create task if worker has files
-                        progress.update(worker_tasks[worker_id], total=len(worker_files))
                         future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id)
                         future_to_worker[future] = worker_id
 
-                # Process completed worker batches
+                # Process results as they complete
                 for future in as_completed(future_to_worker):
                     worker_id = future_to_worker[future]
                     try:
@@ -364,10 +416,13 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                                     outfile.write(output + "\n")
 
-                        # Update progress for entire batch
+                        # Update progress for entire batch at once
                         batch_size = len(batch_results)
-                        progress.update(worker_tasks[worker_id], advance=batch_size,
-                                      filename=os.path.basename(processed_filename) if verbose and processed_filename else "")
+                        if batch_results:
+                            last_result = batch_results[-1]
+                            processed_filename = last_result[6] if len(last_result) > 6 else None
+                            progress.update(worker_tasks[worker_id], advance=batch_size,
+                                          filename=os.path.basename(processed_filename) if verbose and processed_filename else "")
 
                     except Exception as e:
                         print(f"Error in worker {worker_id}: {e}")
@@ -377,50 +432,81 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
     elif parallel and show_progress and HAS_TQDM:
         # Fallback to tqdm for parallel processing
-        if verbose:
-            progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
-        else:
-            progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+        progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
+
+        # Collect all files for tqdm implementation
+        all_files = []
+        for subdir, dirs, files in os.walk("."):
+            if subdir == ".uma":
+                continue
+            if ".uma" in dirs:
+                dirs.remove(".uma")
+
+            for filename in files:
+                if subdir == "." and (filename == hash_file or filename == new_hash_file):
+                    continue
+                full_filename = os.path.join(subdir, filename)
+                if not os.path.islink(full_filename):
+                    all_files.append((subdir, filename, full_filename))
+
+        # Distribute files among workers
+        files_per_worker = len(all_files) // workers
+        extra_files = len(all_files) % workers
+
+        worker_file_lists = []
+        start_idx = 0
+        for i in range(workers):
+            worker_files = files_per_worker
+            if i < extra_files:
+                worker_files += 1
+            end_idx = start_idx + worker_files
+            worker_file_lists.append(all_files[start_idx:end_idx])
+            start_idx = end_idx
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_file = {}
-            for subdir, filename, full_filename in all_files:
-                file_info = (subdir, filename, full_filename, algorithm, str(update), str(append), verbose)
-                future = executor.submit(_process_file_worker, file_info)
-                future_to_file[future] = (subdir, filename, full_filename)
+            # Submit worker tasks
+            future_to_worker = {}
+            for worker_id, worker_files in enumerate(worker_file_lists):
+                if worker_files:
+                    future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id)
+                    future_to_worker[future] = worker_id
 
-            for future in as_completed(future_to_file):
-                subdir, filename, full_filename = future_to_file[future]
+            # Process results
+            for future in as_completed(future_to_worker):
+                worker_id = future_to_worker[future]
                 try:
-                    result = future.result()
-                    if result:
-                        hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
-                        filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                    batch_results = future.result()
+                    for result in batch_results:
+                        if result:
+                            hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
+                            filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
-                        if hashkey in cache:
-                            if update:
-                                cache_data = cache.pop(hashkey)
-                                output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                            if hashkey in cache:
+                                if update:
+                                    cache_data = cache.pop(hashkey)
+                                    output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                    outfile.write(output + "\n")
+                            else:
+                                output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
                                 outfile.write(output + "\n")
-                        else:
-                            output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
-                            outfile.write(output + "\n")
 
-                        # Show filename if verbose
-                        if verbose and processed_filename:
-                            progress_bar.set_description(f"Processing: {os.path.basename(processed_filename)}")
+                            # Show filename if verbose
+                            if verbose and processed_filename:
+                                progress_bar.set_description(f"Processing: {os.path.basename(processed_filename)}")
+
+                    progress_bar.update(len(batch_results))
 
                 except Exception as e:
-                    print(f"Error processing {full_filename}: {e}")
-
-                progress_bar.update(1)
+                    print(f"Error in worker {worker_id}: {e}")
+                    worker_files = worker_file_lists[worker_id]
+                    progress_bar.update(len(worker_files))
 
         progress_bar.close()
 
     else:
         # Sequential processing (original logic)
         if show_progress and HAS_TQDM and not parallel:
-            progress_bar = tqdm(total=len(all_files), desc="Processing files", unit="file")
+            progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
         else:
             progress_bar = None
 
