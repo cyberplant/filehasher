@@ -153,7 +153,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
 def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
     """Generate hash for a string using specified algorithm."""
     hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
-    return hash_func(s.encode("utf-8", "surrogateescape")).hexdigest()
+    return hash_func(s.encode("utf-8", "backslashreplace")).hexdigest()
 
 
 def calculate_hash(f, algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> Tuple[Any, bool]:
