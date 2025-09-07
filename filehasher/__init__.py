@@ -117,7 +117,7 @@ def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: b
     return result
 
 
-def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue: Optional['mp.Queue'] = None) -> List[Tuple]:
+def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue: Optional['mp.Queue'] = None, cache: Optional[dict] = None) -> List[Tuple]:
     """
     Process a batch of files for a single worker.
     This function runs in a separate process.
@@ -146,8 +146,15 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         processed_filename = full_filename if verbose else None
 
         # Check if we can skip this file (for update mode)
-        # Note: We need to pass cache data to workers, but for now we'll handle this in the main process
-        # This is a limitation of the current architecture - workers don't have access to cache
+        if update and cache and hashkey in cache:
+            cache_data = cache[hashkey]
+            if _can_skip_file(full_filename, cache_data, verbose):
+                # File is unchanged, send progress update and continue
+                if progress_queue:
+                    progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
+                # Return the cached data instead of recalculating
+                results.append((hashkey, cache_data[0], subdir, filename, str(file_size), str(file_inode), str(file_mtime), processed_filename))
+                continue
         
         try:
             with open(full_filename, "rb") as f:
@@ -487,14 +494,9 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         ) as progress:
             # Create progress tasks for each worker with correct totals
             worker_tasks = []
-            files_per_worker = total_files // workers
-            extra_files = total_files % workers
-
+            # We'll update these totals after we know the actual distribution
             for i in range(workers):
-                worker_total = files_per_worker
-                if i < extra_files:
-                    worker_total += 1
-                task = progress.add_task(f"Worker {i+1}", total=worker_total, filename="")
+                task = progress.add_task(f"Worker {i+1}", total=0, filename="")
                 worker_tasks.append(task)
 
             # Create progress queues for real-time updates using Manager
@@ -510,11 +512,15 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     # Distribute files among workers based on size for balanced workload
                     worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
 
+                    # Update progress bar totals with actual file counts per worker
+                    for i, worker_files in enumerate(worker_file_lists):
+                        progress.update(worker_tasks[i], total=len(worker_files))
+
                     # Submit all worker tasks at once
                     future_to_worker = {}
                     for worker_id, worker_files in enumerate(worker_file_lists):
                         if worker_files:  # Only create task if worker has files
-                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id])
+                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache)
                             future_to_worker[future] = worker_id
 
                     # Function to monitor progress queues
@@ -572,6 +578,13 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                             else:
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
                                             outfile.write(output + "\n")
+                                        else:
+                                            # Not update mode, just write cached entry
+                                            if len(cache_data) == 5:
+                                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                            else:
+                                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
+                                            outfile.write(output + "\n")
                                     else:
                                         output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
                                         outfile.write(output + "\n")
@@ -605,7 +618,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 future_to_worker = {}
                 for worker_id, worker_files in enumerate(worker_file_lists):
                     if worker_files:
-                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id])
+                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache)
                         future_to_worker[future] = worker_id
 
                 # Function to monitor progress queues
@@ -656,6 +669,13 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     if update:
                                         cache_data = cache.pop(hashkey)
                                         # Handle both old format (5 fields) and new format (6 fields)
+                                        if len(cache_data) == 5:
+                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                        else:
+                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
+                                        outfile.write(output + "\n")
+                                    else:
+                                        # Not update mode, just write cached entry
                                         if len(cache_data) == 5:
                                             output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                         else:
