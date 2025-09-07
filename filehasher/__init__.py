@@ -153,7 +153,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
 def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
     """Generate hash for a string using specified algorithm."""
     hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
-    return hash_func(s.encode("utf-8", "surrogateescape")).hexdigest()
+    return hash_func(s.encode("utf-8", "backslashreplace")).hexdigest()
 
 
 def calculate_hash(f, algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> Tuple[Any, bool]:
@@ -425,14 +425,15 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 if result:
                                     hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
                                     filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                                    subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                                     if hashkey in cache:
                                         if update:
                                             cache_data = cache.pop(hashkey)
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
                                             outfile.write(output + "\n")
                                     else:
-                                        output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
+                                        output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
                                         outfile.write(output + "\n")
 
                         except Exception as e:
@@ -511,14 +512,15 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             if result:
                                 hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
                                 filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                                 if hashkey in cache:
                                     if update:
                                         cache_data = cache.pop(hashkey)
-                                        output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                        output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
                                         outfile.write(output + "\n")
                                 else:
-                                    output = f"{hashkey}|{hexdigest}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
+                                    output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
                                     outfile.write(output + "\n")
 
                     except Exception as e:
@@ -563,11 +565,12 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 key = f"{full_filename}{file_size}{file_stat.st_mtime}"
                 hashkey = _get_hash(key, algorithm)
                 filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                 if hashkey in cache:
                     if update:
                         cache_data = cache.pop(hashkey)
-                        output = f"{hashkey}|{cache_data[0]}|{subdir}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                        output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
                         outfile.write(output + "\n")
                 else:
                     try:
@@ -579,7 +582,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             progress_bar.update(1)
                         continue
 
-                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir}|{filename_encoded}|{file_size}|{file_inode}"
+                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
                     outfile.write(output + "\n")
 
                 processed_count += 1
