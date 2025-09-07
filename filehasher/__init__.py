@@ -42,10 +42,10 @@ DEFAULT_ALGORITHM = 'md5'
 CONFIG_FILE = '.filehasher.ini'
 
 
-def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) -> Tuple[str, str, str, str, str, str, Optional[str]]:
+def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) -> Tuple[str, str, str, str, str, str, str, Optional[str]]:
     """
     Worker function for parallel file processing.
-    Returns (hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename)
+    Returns (hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, processed_filename)
     """
     subdir, filename, full_filename, algorithm, update, append, verbose = file_info
 
@@ -55,8 +55,9 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) 
     file_stat = os.stat(full_filename)
     file_size = file_stat.st_size
     file_inode = file_stat.st_ino
+    file_mtime = file_stat.st_mtime
 
-    key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+    key = f"{full_filename}{file_size}{file_mtime}"
     hashkey = _get_hash(key, algorithm)
 
     processed_filename = full_filename if verbose else None
@@ -69,7 +70,7 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) 
         print(f"Error processing {full_filename}: {e}")
         return None
 
-    return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename
+    return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), str(file_mtime), processed_filename
 
 
 def _collect_files(hash_file: str, collect_paths: bool = False) -> Union[int, List[Tuple[str, str, str]]]:
@@ -127,19 +128,24 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         file_stat = os.stat(full_filename)
         file_size = file_stat.st_size
         file_inode = file_stat.st_ino
+        file_mtime = file_stat.st_mtime
 
-        key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+        key = f"{full_filename}{file_size}{file_mtime}"
         hashkey = _get_hash(key, algorithm)
 
         processed_filename = full_filename if verbose else None
 
+        # Check if we can skip this file (for update mode)
+        # Note: We need to pass cache data to workers, but for now we'll handle this in the main process
+        # This is a limitation of the current architecture - workers don't have access to cache
+        
         try:
             with open(full_filename, "rb") as f:
                 # Use a custom hash function that sends progress updates during processing
                 hashsum, _ = calculate_hash_with_progress(f, algorithm, progress_queue, worker_id, filename, verbose)
             hexdigest = hashsum.hexdigest()
 
-            results.append((hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename))
+            results.append((hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), str(file_mtime), processed_filename))
         except Exception as e:
             print(f"Error processing {full_filename}: {e}")
             continue
@@ -159,6 +165,42 @@ def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
     """Generate hash for a string using specified algorithm."""
     hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
     return hash_func(s.encode("utf-8", "backslashreplace")).hexdigest()
+
+
+def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False) -> bool:
+    """
+    Check if a file can be skipped based on size and modification time.
+    
+    Args:
+        full_filename: Full path to the file
+        cache_data: Tuple containing (hashsum, dirname, filename, file_size, file_inode, file_mtime)
+        verbose: Whether to print skip messages
+        
+    Returns:
+        True if file can be skipped, False otherwise
+    """
+    try:
+        file_stat = os.stat(full_filename)
+        current_size = file_stat.st_size
+        current_mtime = file_stat.st_mtime
+        
+        # Handle both old format (5 fields) and new format (6 fields)
+        if len(cache_data) == 5:
+            cached_size, cached_mtime = int(cache_data[3]), 0  # Old format has no timestamp
+        else:
+            cached_size, cached_mtime = int(cache_data[3]), float(cache_data[5])
+        
+        # Skip if size and modification time match
+        if current_size == cached_size and current_mtime == cached_mtime:
+            if verbose:
+                print(f"Skipping {os.path.basename(full_filename)} (unchanged)")
+            return True
+            
+    except (OSError, ValueError, IndexError):
+        # If we can't stat the file or parse the cache data, don't skip
+        pass
+    
+    return False
 
 
 def calculate_hash(f, algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> Tuple[Any, bool]:
@@ -465,17 +507,21 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             batch_results = future.result()
                             for result in batch_results:
                                 if result:
-                                    hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
+                                    hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, processed_filename = result
                                     filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
                                     subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                                     if hashkey in cache:
                                         if update:
                                             cache_data = cache.pop(hashkey)
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                            # Handle both old format (5 fields) and new format (6 fields)
+                                            if len(cache_data) == 5:
+                                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                            else:
+                                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
                                             outfile.write(output + "\n")
                                     else:
-                                        output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
+                                        output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
                                         outfile.write(output + "\n")
 
                         except Exception as e:
@@ -561,17 +607,21 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         batch_results = future.result()
                         for result in batch_results:
                             if result:
-                                hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
+                                hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, processed_filename = result
                                 filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
                                 subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
 
                                 if hashkey in cache:
                                     if update:
                                         cache_data = cache.pop(hashkey)
-                                        output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                                        # Handle both old format (5 fields) and new format (6 fields)
+                                        if len(cache_data) == 5:
+                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                        else:
+                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
                                         outfile.write(output + "\n")
                                 else:
-                                    output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
+                                    output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
                                     outfile.write(output + "\n")
 
                     except Exception as e:
@@ -612,8 +662,9 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 file_stat = os.stat(full_filename)
                 file_size = file_stat.st_size
                 file_inode = file_stat.st_ino
+                file_mtime = file_stat.st_mtime
 
-                key = f"{full_filename}{file_size}{file_stat.st_mtime}"
+                key = f"{full_filename}{file_size}{file_mtime}"
                 hashkey = _get_hash(key, algorithm)
                 filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
                 subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
@@ -621,7 +672,32 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 if hashkey in cache:
                     if update:
                         cache_data = cache.pop(hashkey)
-                        output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
+                        # Check if we can skip this file based on size and timestamp
+                        if _can_skip_file(full_filename, cache_data, verbose):
+                            # File is unchanged, just write the cached entry
+                            if len(cache_data) == 5:
+                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                            else:
+                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
+                            outfile.write(output + "\n")
+                        else:
+                            # File has changed, recalculate hash
+                            try:
+                                with open(full_filename, "rb") as f:
+                                    hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+                                output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                                outfile.write(output + "\n")
+                            except Exception as e:
+                                print(f"Error processing {full_filename}: {e}")
+                                if progress_bar:
+                                    progress_bar.update(1)
+                                continue
+                    else:
+                        # Not update mode, just write cached entry
+                        if len(cache_data) == 5:
+                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                        else:
+                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
                         outfile.write(output + "\n")
                 else:
                     try:
@@ -633,7 +709,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             progress_bar.update(1)
                         continue
 
-                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
+                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
                     outfile.write(output + "\n")
 
                 processed_count += 1
@@ -673,8 +749,18 @@ def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
             algorithm = line[13:].strip()
             continue
 
-        key, hashsum, dirname, filename, file_size, file_inode = line.split("|")
-        fileinfo = (dirname, filename, file_size, file_inode)
+        parts = line.split("|")
+        if len(parts) == 6:
+            # Old format without timestamp
+            key, hashsum, dirname, filename, file_size, file_inode = parts
+            fileinfo = (dirname, filename, file_size, file_inode, "0")  # Default timestamp for old entries
+        elif len(parts) == 7:
+            # New format with timestamp
+            key, hashsum, dirname, filename, file_size, file_inode, file_mtime = parts
+            fileinfo = (dirname, filename, file_size, file_inode, file_mtime)
+        else:
+            # Skip malformed lines
+            continue
 
         if hashsum in destDict:
             if hashsum in repeated:
@@ -685,7 +771,7 @@ def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
         destDict[hashsum] = fileinfo
 
         if cache_data is not None:
-            cache_data[key] = (hashsum, dirname, filename, file_size, file_inode)
+            cache_data[key] = (hashsum, dirname, filename, file_size, file_inode, fileinfo[4])  # Include timestamp
 
     f.close()
     return destDict, algorithm
