@@ -148,7 +148,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         # Check if we can skip this file (for update mode)
         if update and cache and hashkey in cache:
             cache_data = cache[hashkey]
-            if _can_skip_file(full_filename, cache_data, verbose, progress_queue, worker_id):
+            if _can_skip_file(full_filename, cache_data, verbose, progress_queue, worker_id, file_stat):
                 # File is unchanged, send progress update and continue
                 if progress_queue:
                     progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
@@ -230,7 +230,7 @@ def _distribute_files_by_size(files_with_sizes: List[Tuple[str, str, str, int]],
     return worker_lists
 
 
-def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False, progress_queue: Optional['mp.Queue'] = None, worker_id: int = 0) -> bool:
+def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False, progress_queue: Optional['mp.Queue'] = None, worker_id: int = 0, file_stat: Optional[os.stat_result] = None) -> bool:
     """
     Check if a file can be skipped based on size and modification time.
     
@@ -240,12 +240,16 @@ def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False,
         verbose: Whether to send skip messages via progress queue
         progress_queue: Queue to send verbose messages to (for parallel processing)
         worker_id: Worker ID for progress messages
+        file_stat: Optional pre-retrieved file stats to avoid duplicate os.stat() calls
         
     Returns:
         True if file can be skipped, False otherwise
     """
     try:
-        file_stat = os.stat(full_filename)
+        # Use provided file_stat or get it if not provided (for backward compatibility)
+        if file_stat is None:
+            file_stat = os.stat(full_filename)
+        
         current_size = file_stat.st_size
         current_mtime = file_stat.st_mtime
         
@@ -746,7 +750,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     if update:
                         cache_data = cache.pop(hashkey)
                         # Check if we can skip this file based on size and timestamp
-                        if _can_skip_file(full_filename, cache_data, verbose):
+                        if _can_skip_file(full_filename, cache_data, verbose, file_stat=file_stat):
                             # File is unchanged, just write the cached entry
                             if len(cache_data) == 5:
                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
