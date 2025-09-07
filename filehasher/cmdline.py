@@ -24,6 +24,7 @@ Examples:
   %(prog)s --generate --parallel --workers 2 --verbose
   %(prog)s --generate --directory /path/to/files
   %(prog)s --update --directory ~/Downloads --parallel
+  %(prog)s --generate --write-frequency 50
 
 Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
         """
@@ -90,6 +91,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
     parser.add_argument('--directory', '-d', dest="directory",
                         help="Directory to process (default: current directory)")
 
+    parser.add_argument('--write-frequency', type=int, default=100, dest="write_frequency",
+                        help="Write to hash file every N entries (default: %(default)s)")
+
     parser.add_argument('--version', '-V', action='version', version=__version__,
                         help="Show version information")
 
@@ -149,7 +153,8 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             parallel=args.parallel,
             workers=args.workers,
             verbose=args.verbose,
-            directory=args.directory
+            directory=args.directory,
+            write_frequency=args.write_frequency
         )
     elif args.append:
         print(f"Appending {args.algorithm} hashes...")
@@ -161,7 +166,8 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             parallel=args.parallel,
             workers=args.workers,
             verbose=args.verbose,
-            directory=args.directory
+            directory=args.directory,
+            write_frequency=args.write_frequency
         )
     elif args.update:
         print(f"Updating {args.algorithm} hashes...")
@@ -173,7 +179,8 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             parallel=args.parallel,
             workers=args.workers,
             verbose=args.verbose,
-            directory=args.directory
+            directory=args.directory,
+            write_frequency=args.write_frequency
         )
     elif args.compare:
         filehasher.compare(args.hashfile, args.compare)

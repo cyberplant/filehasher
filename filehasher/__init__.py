@@ -437,8 +437,22 @@ def save_config(config_dict: Dict[str, Any]) -> None:
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                    algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True,
                    parallel: bool = False, workers: Optional[int] = None,
-                   verbose: bool = False, directory: Optional[str] = None) -> None:
-    """Generate hash file for all files in specified directory tree."""
+                   verbose: bool = False, directory: Optional[str] = None,
+                   write_frequency: int = 100) -> None:
+    """Generate hash file for all files in specified directory tree.
+    
+    Args:
+        hash_file: Path to the hash file to create/update
+        update: Whether to update existing hash file
+        append: Whether to append to existing hash file
+        algorithm: Hash algorithm to use
+        show_progress: Whether to show progress bars
+        parallel: Whether to use parallel processing
+        workers: Number of parallel workers
+        verbose: Whether to show verbose output
+        directory: Directory to process (default: current directory)
+        write_frequency: Write to file every N entries (default: 100)
+    """
     # Validate directory if provided
     if directory and not os.path.exists(directory):
         raise FileNotFoundError(f"Directory not found: {directory}")
@@ -578,7 +592,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                     monitor_thread.start()
 
-                    # Process results as they complete
+                    # Process results as they complete with incremental writing
+                    results_buffer = []
+                    results_written = 0
+                    
                     for future in as_completed(future_to_worker):
                         worker_id = future_to_worker[future]
                         try:
@@ -597,22 +614,37 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                             else:
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                            outfile.write(output + "\n")
+                                            results_buffer.append(output)
                                         else:
                                             # Not update mode, just write cached entry
                                             if len(cache_data) == 5:
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                             else:
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                            outfile.write(output + "\n")
+                                            results_buffer.append(output)
                                     else:
                                         output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                        outfile.write(output + "\n")
+                                        results_buffer.append(output)
+                                    
+                                    # Write to file periodically
+                                    if len(results_buffer) >= write_frequency:
+                                        for output_line in results_buffer:
+                                            outfile.write(output_line + "\n")
+                                        outfile.flush()  # Ensure data is written to disk
+                                        results_written += len(results_buffer)
+                                        results_buffer = []
 
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
                             # Mark worker as completed to avoid hanging
                             worker_completed[worker_id] = True
+                    
+                    # Write any remaining results
+                    if results_buffer:
+                        for output_line in results_buffer:
+                            outfile.write(output_line + "\n")
+                        outfile.flush()
+                        results_written += len(results_buffer)
 
                     # Wait for progress monitoring to complete
                     monitor_thread.join()
@@ -678,7 +710,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                 monitor_thread.start()
 
-                # Process results
+                # Process results with incremental writing
+                results_buffer = []
+                results_written = 0
+                
                 for future in as_completed(future_to_worker):
                     worker_id = future_to_worker[future]
                     try:
@@ -697,22 +732,37 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                             output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                         else:
                                             output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                        outfile.write(output + "\n")
+                                        results_buffer.append(output)
                                     else:
                                         # Not update mode, just write cached entry
                                         if len(cache_data) == 5:
                                             output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                         else:
                                             output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                        outfile.write(output + "\n")
+                                        results_buffer.append(output)
                                 else:
                                     output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                    outfile.write(output + "\n")
+                                    results_buffer.append(output)
+                                
+                                # Write to file periodically
+                                if len(results_buffer) >= write_frequency:
+                                    for output_line in results_buffer:
+                                        outfile.write(output_line + "\n")
+                                    outfile.flush()  # Ensure data is written to disk
+                                    results_written += len(results_buffer)
+                                    results_buffer = []
 
                     except Exception as e:
                         print(f"Error in worker {worker_id}: {e}")
                         # Mark worker as completed to avoid hanging
                         worker_completed[worker_id] = True
+                
+                # Write any remaining results
+                if results_buffer:
+                    for output_line in results_buffer:
+                        outfile.write(output_line + "\n")
+                    outfile.flush()
+                    results_written += len(results_buffer)
 
                 # Wait for progress monitoring to complete
                 monitor_thread.join()
