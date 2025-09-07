@@ -120,6 +120,10 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
                 progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
             continue
 
+        # Send "start processing" message BEFORE starting to process the file
+        if progress_queue and verbose:
+            progress_queue.put(('start_processing', worker_id, 0, filename))
+
         file_stat = os.stat(full_filename)
         file_size = file_stat.st_size
         file_inode = file_stat.st_ino
@@ -131,7 +135,8 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
 
         try:
             with open(full_filename, "rb") as f:
-                hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+                # Use a custom hash function that sends progress updates during processing
+                hashsum, _ = calculate_hash_with_progress(f, algorithm, progress_queue, worker_id, filename, verbose)
             hexdigest = hashsum.hexdigest()
 
             results.append((hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename))
@@ -139,7 +144,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
             print(f"Error processing {full_filename}: {e}")
             continue
 
-        # Send progress update for each processed file
+        # Send progress update for each completed file
         if progress_queue:
             progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
 
@@ -174,6 +179,31 @@ def calculate_hash(f, algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = 
             dirty = True
             sys.stdout.write(("/", "|", "\\", "-")[readcount % 4])
             sys.stdout.flush()
+        hashsum.update(block)
+
+    return hashsum, dirty
+
+
+def calculate_hash_with_progress(f, algorithm: str = DEFAULT_ALGORITHM, progress_queue: Optional['mp.Queue'] = None, worker_id: int = 0, filename: str = "", verbose: bool = False) -> Tuple[Any, bool]:
+    """Calculate hash for a file with real-time progress updates via queue."""
+    hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
+    hashsum = hash_func()
+    readcount = 0
+    dirty = False
+    bytes_read = 0
+
+    while True:
+        block = f.read(BLOCKSIZE)
+        if not block:
+            break
+        readcount += 1
+        bytes_read += len(block)
+        
+        # Send progress updates during processing for large files
+        if progress_queue and verbose and readcount > 0 and readcount % 10 == 0:
+            # Send periodic updates during file processing
+            progress_queue.put(('processing', worker_id, 0, filename, bytes_read))
+        
         hashsum.update(block)
 
     return hashsum, dirty
@@ -405,6 +435,18 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                         _, wid, advance, filename = message
                                         progress.update(worker_tasks[wid], advance=advance,
                                                       filename=os.path.basename(filename) if verbose and filename else "")
+                                    elif message[0] == 'start_processing':
+                                        _, wid, advance, filename = message
+                                        # Update the display to show the file that's about to be processed
+                                        progress.update(worker_tasks[wid], advance=advance,
+                                                      filename=f"Starting: {os.path.basename(filename)}" if verbose and filename else "")
+                                    elif message[0] == 'processing':
+                                        _, wid, advance, filename, bytes_read = message
+                                        # Show the file currently being processed with bytes read
+                                        if verbose and filename:
+                                            size_mb = bytes_read / (1024 * 1024)
+                                            progress.update(worker_tasks[wid], advance=advance,
+                                                          filename=f"Processing: {os.path.basename(filename)} ({size_mb:.1f}MB)")
                                     elif message[0] == 'done':
                                         worker_completed[message[1]] = True
                                 except queue.Empty:
@@ -490,8 +532,17 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 if message[0] == 'progress':
                                     _, wid, advance, filename = message
                                     if verbose and filename:
-                                        progress_bar.set_description(f"Worker {wid+1}: {os.path.basename(filename)}")
+                                        progress_bar.set_description(f"Worker {wid+1}: Completed {os.path.basename(filename)}")
                                     progress_bar.update(advance)
+                                elif message[0] == 'start_processing':
+                                    _, wid, advance, filename = message
+                                    if verbose and filename:
+                                        progress_bar.set_description(f"Worker {wid+1}: Starting {os.path.basename(filename)}")
+                                elif message[0] == 'processing':
+                                    _, wid, advance, filename, bytes_read = message
+                                    if verbose and filename:
+                                        size_mb = bytes_read / (1024 * 1024)
+                                        progress_bar.set_description(f"Worker {wid+1}: Processing {os.path.basename(filename)} ({size_mb:.1f}MB)")
                                 elif message[0] == 'done':
                                     worker_completed[message[1]] = True
                             except queue.Empty:
