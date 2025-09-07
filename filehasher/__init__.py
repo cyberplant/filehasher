@@ -190,6 +190,13 @@ def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False)
         else:
             cached_size, cached_mtime = int(cache_data[3]), float(cache_data[5])
         
+        # Don't skip if the cached timestamp is 0 (old format) or very old (likely from archives)
+        # Files with timestamps before 1990 are likely from archives and shouldn't be skipped
+        if cached_mtime == 0 or cached_mtime < 631152000:  # 631152000 = Jan 1, 1990
+            if verbose:
+                print(f"Processing {os.path.basename(full_filename)} (old/invalid timestamp)")
+            return False
+        
         # Skip if size and modification time match
         if current_size == cached_size and current_mtime == cached_mtime:
             if verbose:
