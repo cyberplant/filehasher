@@ -148,7 +148,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         # Check if we can skip this file (for update mode)
         if update and cache and hashkey in cache:
             cache_data = cache[hashkey]
-            if _can_skip_file(full_filename, cache_data, verbose):
+            if _can_skip_file(full_filename, cache_data, verbose, progress_queue, worker_id):
                 # File is unchanged, send progress update and continue
                 if progress_queue:
                     progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
@@ -230,14 +230,16 @@ def _distribute_files_by_size(files_with_sizes: List[Tuple[str, str, str, int]],
     return worker_lists
 
 
-def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False) -> bool:
+def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False, progress_queue: Optional['mp.Queue'] = None, worker_id: int = 0) -> bool:
     """
     Check if a file can be skipped based on size and modification time.
     
     Args:
         full_filename: Full path to the file
         cache_data: Tuple containing (hashsum, dirname, filename, file_size, file_inode, file_mtime)
-        verbose: Whether to print skip messages
+        verbose: Whether to send skip messages via progress queue
+        progress_queue: Queue to send verbose messages to (for parallel processing)
+        worker_id: Worker ID for progress messages
         
     Returns:
         True if file can be skipped, False otherwise
@@ -256,14 +258,14 @@ def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False)
         # Don't skip if the cached timestamp is 0 (old format) or very old (likely from archives)
         # Files with timestamps before 1990 are likely from archives and shouldn't be skipped
         if cached_mtime == 0 or cached_mtime < 631152000:  # 631152000 = Jan 1, 1990
-            if verbose:
-                print(f"Processing {os.path.basename(full_filename)} (old/invalid timestamp)")
+            if verbose and progress_queue:
+                progress_queue.put(('verbose', worker_id, 0, f"Processing {os.path.basename(full_filename)} (old/invalid timestamp)"))
             return False
         
         # Skip if size and modification time match
         if current_size == cached_size and current_mtime == cached_mtime:
-            if verbose:
-                print(f"Skipping {os.path.basename(full_filename)} (unchanged)")
+            if verbose and progress_queue:
+                progress_queue.put(('verbose', worker_id, 0, f"Skipping {os.path.basename(full_filename)} (unchanged)"))
             return True
             
     except (OSError, ValueError, IndexError):
@@ -547,6 +549,12 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                             size_mb = bytes_read / (1024 * 1024)
                                             progress.update(worker_tasks[wid], advance=advance,
                                                           filename=f"Processing: {os.path.basename(filename)} ({size_mb:.1f}MB)")
+                                    elif message[0] == 'verbose':
+                                        _, wid, advance, verbose_msg = message
+                                        # Show verbose messages in the progress bar
+                                        if verbose:
+                                            progress.update(worker_tasks[wid], advance=advance,
+                                                          filename=verbose_msg)
                                     elif message[0] == 'done':
                                         worker_completed[message[1]] = True
                                 except queue.Empty:
@@ -643,6 +651,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     if verbose and filename:
                                         size_mb = bytes_read / (1024 * 1024)
                                         progress_bar.set_description(f"Worker {wid+1}: Processing {os.path.basename(filename)} ({size_mb:.1f}MB)")
+                                elif message[0] == 'verbose':
+                                    _, wid, advance, verbose_msg = message
+                                    if verbose:
+                                        progress_bar.set_description(f"Worker {wid+1}: {verbose_msg}")
                                 elif message[0] == 'done':
                                     worker_completed[message[1]] = True
                             except queue.Empty:
