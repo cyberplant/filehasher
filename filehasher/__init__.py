@@ -73,15 +73,16 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) 
     return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), str(file_mtime), processed_filename
 
 
-def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False) -> Union[int, List[Tuple[str, str, str]], List[Tuple[str, str, str, int]]]:
+def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False, directory: Optional[str] = None) -> Union[int, List[Tuple[str, str, str]], List[Tuple[str, str, str, int]]]:
     """
-    Collect files from current directory for processing.
+    Collect files from specified directory for processing.
 
     Args:
         hash_file: Name of the hash file to exclude
         collect_paths: If True, return list of (subdir, filename, full_filename)
         collect_sizes: If True, return list of (subdir, filename, full_filename, file_size)
                       If False, return count of files only
+        directory: Directory to process (default: current directory)
 
     Returns:
         If collect_paths is False: total file count (int)
@@ -89,8 +90,9 @@ def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: b
         If collect_paths is True and collect_sizes is True: list of file tuples with sizes
     """
     result = [] if collect_paths else 0
+    start_dir = directory if directory else "."
 
-    for subdir, dirs, files in os.walk("."):
+    for subdir, dirs, files in os.walk(start_dir):
         if subdir == ".uma":
             continue
         if ".uma" in dirs:
@@ -435,8 +437,14 @@ def save_config(config_dict: Dict[str, Any]) -> None:
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                    algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True,
                    parallel: bool = False, workers: Optional[int] = None,
-                   verbose: bool = False) -> None:
-    """Generate hash file for all files in current directory tree."""
+                   verbose: bool = False, directory: Optional[str] = None) -> None:
+    """Generate hash file for all files in specified directory tree."""
+    # Validate directory if provided
+    if directory and not os.path.exists(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    if directory and not os.path.isdir(directory):
+        raise NotADirectoryError(f"Path is not a directory: {directory}")
+    
     cache = {}
     existing_algorithm = None
 
@@ -470,7 +478,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             outfile.write(f"# Algorithm: {algorithm}\n")
 
     # Count total files first for progress tracking (much faster than collecting all)
-    total_files = _collect_files(hash_file, collect_paths=False)
+    total_files = _collect_files(hash_file, collect_paths=False, directory=directory)
 
 
     # Determine number of workers
@@ -513,7 +521,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 # Process files on-the-fly with parallel workers using shared list
                 with ProcessPoolExecutor(max_workers=workers) as executor:
                     # Collect all files with sizes for balanced distribution
-                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True)
+                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
 
                     # Distribute files among workers based on size for balanced workload
                     worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
@@ -615,7 +623,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
 
         # Collect all files with sizes for balanced distribution
-        all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True)
+        all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
 
         # Distribute files among workers based on size for balanced workload
         worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
@@ -720,7 +728,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
         processed_count = 0
 
-        for subdir, dirs, files in os.walk("."):
+        start_dir = directory if directory else "."
+        for subdir, dirs, files in os.walk(start_dir):
             if not files:
                 continue
             if subdir == ".uma":

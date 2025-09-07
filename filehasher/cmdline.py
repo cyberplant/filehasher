@@ -22,6 +22,8 @@ Examples:
   %(prog)s --generate --parallel --algorithm sha256
   %(prog)s --generate --parallel --verbose
   %(prog)s --generate --parallel --workers 2 --verbose
+  %(prog)s --generate --directory /path/to/files
+  %(prog)s --update --directory ~/Downloads --parallel
 
 Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
         """
@@ -85,6 +87,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
                         dest="verbose",
                         help="Show detailed progress including filenames being processed")
 
+    parser.add_argument('--directory', '-d', dest="directory",
+                        help="Directory to process (default: current directory)")
+
     parser.add_argument('--version', '-V', action='version', version=__version__,
                         help="Show version information")
 
@@ -143,7 +148,8 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             show_progress=show_progress,
             parallel=args.parallel,
             workers=args.workers,
-            verbose=args.verbose
+            verbose=args.verbose,
+            directory=args.directory
         )
     elif args.append:
         print(f"Appending {args.algorithm} hashes...")
@@ -154,7 +160,8 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             show_progress=show_progress,
             parallel=args.parallel,
             workers=args.workers,
-            verbose=args.verbose
+            verbose=args.verbose,
+            directory=args.directory
         )
     elif args.update:
         print(f"Updating {args.algorithm} hashes...")
@@ -165,7 +172,8 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             show_progress=show_progress,
             parallel=args.parallel,
             workers=args.workers,
-            verbose=args.verbose
+            verbose=args.verbose,
+            directory=args.directory
         )
     elif args.compare:
         filehasher.compare(args.hashfile, args.compare)
