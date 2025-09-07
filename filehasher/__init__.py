@@ -73,18 +73,20 @@ def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) 
     return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), str(file_mtime), processed_filename
 
 
-def _collect_files(hash_file: str, collect_paths: bool = False) -> Union[int, List[Tuple[str, str, str]]]:
+def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False) -> Union[int, List[Tuple[str, str, str]], List[Tuple[str, str, str, int]]]:
     """
     Collect files from current directory for processing.
 
     Args:
         hash_file: Name of the hash file to exclude
         collect_paths: If True, return list of (subdir, filename, full_filename)
+        collect_sizes: If True, return list of (subdir, filename, full_filename, file_size)
                       If False, return count of files only
 
     Returns:
         If collect_paths is False: total file count (int)
-        If collect_paths is True: list of file tuples
+        If collect_paths is True and collect_sizes is False: list of file tuples
+        If collect_paths is True and collect_sizes is True: list of file tuples with sizes
     """
     result = [] if collect_paths else 0
 
@@ -100,7 +102,15 @@ def _collect_files(hash_file: str, collect_paths: bool = False) -> Union[int, Li
             full_filename = os.path.join(subdir, filename)
             if not os.path.islink(full_filename):
                 if collect_paths:
-                    result.append((subdir, filename, full_filename))
+                    if collect_sizes:
+                        try:
+                            file_size = os.path.getsize(full_filename)
+                            result.append((subdir, filename, full_filename, file_size))
+                        except OSError:
+                            # Skip files we can't stat
+                            continue
+                    else:
+                        result.append((subdir, filename, full_filename))
                 else:
                     result += 1
 
@@ -165,6 +175,52 @@ def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
     """Generate hash for a string using specified algorithm."""
     hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
     return hash_func(s.encode("utf-8", "backslashreplace")).hexdigest()
+
+
+def _distribute_files_by_size(files_with_sizes: List[Tuple[str, str, str, int]], workers: int, verbose: bool = False) -> List[List[Tuple[str, str, str]]]:
+    """
+    Distribute files among workers based on file sizes to balance workload.
+    
+    Uses a greedy algorithm to assign files to workers, always assigning
+    the next file to the worker with the smallest current total size.
+    
+    Args:
+        files_with_sizes: List of (subdir, filename, full_filename, file_size) tuples
+        workers: Number of workers
+        verbose: Whether to print distribution statistics
+        
+    Returns:
+        List of worker file lists, where each worker gets (subdir, filename, full_filename) tuples
+    """
+    if not files_with_sizes or workers <= 0:
+        return [[] for _ in range(workers)]
+    
+    # Sort files by size (largest first) for better distribution
+    sorted_files = sorted(files_with_sizes, key=lambda x: x[3], reverse=True)
+    
+    # Initialize worker lists and their total sizes
+    worker_lists = [[] for _ in range(workers)]
+    worker_sizes = [0] * workers
+    
+    # Assign each file to the worker with the smallest current total size
+    for subdir, filename, full_filename, file_size in sorted_files:
+        # Find worker with smallest total size
+        min_worker = min(range(workers), key=lambda i: worker_sizes[i])
+        
+        # Assign file to this worker
+        worker_lists[min_worker].append((subdir, filename, full_filename))
+        worker_sizes[min_worker] += file_size
+    
+    # Print distribution statistics if verbose
+    if verbose:
+        total_size = sum(worker_sizes)
+        print(f"Size-aware distribution: {len(files_with_sizes)} files, {total_size / (1024*1024):.1f}MB total")
+        for i, size in enumerate(worker_sizes):
+            size_mb = size / (1024*1024)
+            percentage = (size / total_size * 100) if total_size > 0 else 0
+            print(f"  Worker {i+1}: {len(worker_lists[i])} files, {size_mb:.1f}MB ({percentage:.1f}%)")
+    
+    return worker_lists
 
 
 def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False) -> bool:
@@ -448,22 +504,11 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
                 # Process files on-the-fly with parallel workers using shared list
                 with ProcessPoolExecutor(max_workers=workers) as executor:
-                    # Collect all files for processing
-                    all_files = _collect_files(hash_file, collect_paths=True)
+                    # Collect all files with sizes for balanced distribution
+                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True)
 
-                    # Distribute files among workers more evenly
-                    files_per_worker = len(all_files) // workers
-                    extra_files = len(all_files) % workers
-
-                    worker_file_lists = []
-                    start_idx = 0
-                    for i in range(workers):
-                        worker_files = files_per_worker
-                        if i < extra_files:
-                            worker_files += 1
-                        end_idx = start_idx + worker_files
-                        worker_file_lists.append(all_files[start_idx:end_idx])
-                        start_idx = end_idx
+                    # Distribute files among workers based on size for balanced workload
+                    worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
 
                     # Submit all worker tasks at once
                     future_to_worker = {}
@@ -544,22 +589,11 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         import threading
         progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
 
-        # Collect all files for tqdm implementation
-        all_files = _collect_files(hash_file, collect_paths=True)
+        # Collect all files with sizes for balanced distribution
+        all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True)
 
-        # Distribute files among workers
-        files_per_worker = len(all_files) // workers
-        extra_files = len(all_files) % workers
-
-        worker_file_lists = []
-        start_idx = 0
-        for i in range(workers):
-            worker_files = files_per_worker
-            if i < extra_files:
-                worker_files += 1
-            end_idx = start_idx + worker_files
-            worker_file_lists.append(all_files[start_idx:end_idx])
-            start_idx = end_idx
+        # Distribute files among workers based on size for balanced workload
+        worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
 
         # Create progress queues for real-time updates using Manager
         with mp.Manager() as manager:
