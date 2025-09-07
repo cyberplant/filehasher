@@ -125,6 +125,7 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
     This function runs in a separate process.
     """
     results = []
+    skipped_count = 0  # Track skipped files for batched progress updates
 
     for subdir, filename, full_filename in worker_files:
         if os.path.islink(full_filename):
@@ -151,9 +152,8 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         if update and cache and hashkey in cache:
             cache_data = cache[hashkey]
             if _can_skip_file(full_filename, cache_data, verbose, progress_queue, worker_id, file_stat):
-                # File is unchanged, send progress update and continue
-                if progress_queue:
-                    progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
+                # File is unchanged, batch progress updates
+                skipped_count += 1
                 # Return the cached data instead of recalculating
                 results.append((hashkey, cache_data[0], subdir, filename, str(file_size), str(file_inode), str(file_mtime), processed_filename))
                 continue
@@ -172,6 +172,10 @@ def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: s
         # Send progress update for each completed file
         if progress_queue:
             progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
+
+    # Send batched progress update for skipped files
+    if progress_queue and skipped_count > 0:
+        progress_queue.put(('progress', worker_id, skipped_count, f"Skipped {skipped_count} files" if verbose else None))
 
     # Signal completion
     if progress_queue:
@@ -264,14 +268,10 @@ def _can_skip_file(full_filename: str, cache_data: tuple, verbose: bool = False,
         # Don't skip if the cached timestamp is 0 (old format) or very old (likely from archives)
         # Files with timestamps before 1990 are likely from archives and shouldn't be skipped
         if cached_mtime == 0 or cached_mtime < 631152000:  # 631152000 = Jan 1, 1990
-            if verbose and progress_queue:
-                progress_queue.put(('verbose', worker_id, 0, f"Processing {os.path.basename(full_filename)} (old/invalid timestamp)"))
             return False
         
         # Skip if size and modification time match
         if current_size == cached_size and current_mtime == cached_mtime:
-            if verbose and progress_queue:
-                progress_queue.put(('verbose', worker_id, 0, f"Skipping {os.path.basename(full_filename)} (unchanged)"))
             return True
             
     except (OSError, ValueError, IndexError):
@@ -319,9 +319,9 @@ def calculate_hash_with_progress(f, algorithm: str = DEFAULT_ALGORITHM, progress
         readcount += 1
         bytes_read += len(block)
         
-        # Send progress updates during processing for large files
-        if progress_queue and verbose and readcount > 0 and readcount % 10 == 0:
-            # Send periodic updates during file processing
+        # Send progress updates during processing for large files (less frequently)
+        if progress_queue and verbose and readcount > 0 and readcount % 100 == 0:
+            # Send periodic updates during file processing (reduced frequency)
             progress_queue.put(('processing', worker_id, 0, filename, bytes_read))
         
         hashsum.update(block)
