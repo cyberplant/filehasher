@@ -279,6 +279,9 @@ class HashfileBrowser:
         # Get items to display (now using the centralized method)
         items = self.get_current_items()
 
+        # Calculate optimal layout for current directory
+        layout = self.calculate_layout(items)
+
         # Find max size for size bars (excluding parent directory ".." which has size 0)
         max_size = 0
         if self.show_size_bars:
@@ -310,8 +313,16 @@ class HashfileBrowser:
             # Create line with proper spacing
             marker = ">" if is_selected else " "
 
-            # Colorize the name
-            colored_name = self.colorize_item(name, is_dir, is_selected)
+            # Get the allocated width for filenames from layout
+            name_width = layout['name_width']
+
+            # Always truncate to fit - be more aggressive about this
+            # Subtract 2 for padding, but ensure we don't go below minimum readable length
+            max_filename_display = max(15, name_width - 2)  # Minimum 15 chars for readability
+            truncated_name = self.truncate_filename(name, max_filename_display)
+
+            # Colorize the truncated name and size
+            colored_name = self.colorize_item(truncated_name, is_dir, is_selected)
             colored_size = self.colorize_size(size_str)
 
             if self.show_size_bars and max_size > 0:
@@ -319,13 +330,64 @@ class HashfileBrowser:
                 size_bar = self.create_size_bar(size, max_size, bar_width=10)
                 ratio = size / max_size if max_size > 0 else 0
                 colored_bar = self.colorize_size_bar(size_bar, ratio)
-                line = f"{marker} {colored_name:<30} {colored_bar} {colored_size:>10}"
-            else:
-                # No size bar
-                line = f"{marker} {colored_name:<40} {colored_size:>10}"
 
-            # Truncate to terminal width
-            print(line[:width])
+                # Use calculated layout positions
+                name_width = layout['name_width']
+                bar_position = layout['bar_position']
+
+                # Build the line with proper visual alignment
+                line_parts = [marker, " ", colored_name]
+                current_pos = 2 + self.get_visual_length(colored_name)  # marker + space + name
+
+                # Add padding to reach bar position
+                while current_pos < bar_position:
+                    line_parts.append(" ")
+                    current_pos += 1
+
+                line_parts.extend([colored_bar, " ", colored_size])
+                line = "".join(line_parts)
+            else:
+                # No size bar - use dynamic filename width
+                name_width = layout['name_width']
+                line = f"{marker} {colored_name:<{name_width}} {colored_size:>10}"
+
+            # Final safety check: ensure filename is properly truncated
+            visual_name = self.strip_ansi_codes(colored_name)
+            if len(visual_name) > max_filename_display:
+                # Emergency truncation if something went wrong
+                safe_name = self.truncate_filename(truncated_name, max_filename_display)
+                colored_name = self.colorize_item(safe_name, is_dir, is_selected)
+
+                # Rebuild the line with the corrected name
+                if self.show_size_bars and max_size > 0:
+                    size_bar = self.create_size_bar(size, max_size, bar_width=10)
+                    ratio = size / max_size if max_size > 0 else 0
+                    colored_bar = self.colorize_size_bar(size_bar, ratio)
+
+                    line_parts = [marker, " ", colored_name]
+                    current_pos = 2 + self.get_visual_length(colored_name)
+                    while current_pos < bar_position:
+                        line_parts.append(" ")
+                        current_pos += 1
+                    line_parts.extend([colored_bar, " ", colored_size])
+                    line = "".join(line_parts)
+                else:
+                    line = f"{marker} {colored_name:<{name_width}} {colored_size:>10}"
+
+            # Truncate to terminal width (but account for ANSI codes in truncation)
+            visual_line = self.strip_ansi_codes(line)
+            if len(visual_line) > width:
+                # Need to truncate while preserving ANSI codes
+                truncated_visual = visual_line[:width]
+                # Find corresponding position in original string
+                ansi_chars = 0
+                for i, char in enumerate(line):
+                    if i - ansi_chars >= len(truncated_visual):
+                        line = line[:i]
+                        break
+                    if char == '\x1b':  # Start of ANSI sequence
+                        ansi_chars += 1
+            print(line)
         
         # Footer
         print("-" * min(60, width))
@@ -450,6 +512,97 @@ class HashfileBrowser:
     def colorize_footer(self, footer: str) -> str:
         """Colorize footer text."""
         return f"{Colors.DIM}{footer}{Colors.RESET}"
+
+    def strip_ansi_codes(self, text: str) -> str:
+        """Remove ANSI escape codes from text for length calculation."""
+        import re
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+
+    def get_visual_length(self, text: str) -> int:
+        """Get the visual length of text (excluding ANSI codes)."""
+        return len(self.strip_ansi_codes(text))
+
+    def truncate_filename(self, filename: str, max_length: int) -> str:
+        """Truncate filename intelligently if too long."""
+        if len(filename) <= max_length:
+            return filename
+
+        # For very constrained space, prioritize showing the end (extension)
+        if max_length <= 12:
+            if max_length <= 6:
+                # Very constrained, just truncate
+                return filename[:max_length]
+            else:
+                # Show end with "..."
+                return "..." + filename[-(max_length-3):]
+
+        # Keep extension if present and we have reasonable space
+        if '.' in filename:
+            name_part, ext = filename.rsplit('.', 1)
+            ext = '.' + ext
+            ext_len = len(ext)
+
+            # Reserve space for extension and "..."
+            available_for_name = max_length - ext_len - 3  # 3 for "..."
+
+            # Only use extension-preserving truncation if we have enough space for meaningful name
+            if available_for_name >= 10:
+                truncated_name = name_part[:available_for_name] + "..." + ext
+                return truncated_name
+
+        # Fallback: show start and end with "..." in middle
+        start_len = max(3, max_length // 2 - 1)
+        end_len = max(3, max_length - start_len - 3)
+        return filename[:start_len] + "..." + filename[-end_len:]
+
+    def calculate_layout(self, items: List) -> dict:
+        """Calculate optimal layout based on content and terminal width."""
+        width, height = self.get_terminal_size()
+
+        # Find the longest filename in current directory
+        max_name_len = 0
+        for name, size, is_dir, obj in items:
+            visual_name_len = len(name)  # Raw filename length
+            max_name_len = max(max_name_len, visual_name_len)
+
+        # Calculate positions
+        marker_space = 2  # ">" + space
+        bar_width = 12 if self.show_size_bars else 0  # "[██████████]" + space
+        size_width = 10  # Size string width
+        min_name_width = 15  # Minimum readable filename width
+
+        # Calculate available space for filename
+        available_for_name = width - marker_space - bar_width - size_width - 2  # -2 for spacing
+
+        # Determine optimal filename width based on content and available space
+        if available_for_name < min_name_width:
+            # Not enough space, disable bars if enabled to gain more space
+            if self.show_size_bars:
+                self.show_size_bars = False
+                bar_width = 0
+                available_for_name = width - marker_space - bar_width - size_width - 2
+
+            if available_for_name < min_name_width:
+                # Still not enough space, use minimum (will cause truncation)
+                optimal_name_width = min_name_width
+            else:
+                optimal_name_width = available_for_name
+        else:
+            # Use the full available space - let filenames be as long as possible
+            optimal_name_width = available_for_name
+
+        # If we still exceed terminal width, adjust
+        total_needed = marker_space + optimal_name_width + bar_width + size_width + 2
+        if total_needed > width:
+            optimal_name_width = width - marker_space - bar_width - size_width - 2
+            optimal_name_width = max(min_name_width, optimal_name_width)
+
+        return {
+            'name_width': optimal_name_width,
+            'bar_position': marker_space + optimal_name_width,
+            'total_width': total_needed
+        }
 
     def get_current_items(self) -> List:
         """Get list of current directory items."""
