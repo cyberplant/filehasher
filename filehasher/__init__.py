@@ -165,7 +165,7 @@ def _can_skip_file(hashkey: str, file_size: int, file_inode: int, file_mtime: fl
             cached_inode == file_inode and 
             cached_mtime == file_mtime)
 
-def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue, cache: Dict) -> List[Tuple]:
+def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue, cache: Dict, writer_queue=None) -> List[Tuple]:
     """Process a batch of files in a worker process."""
     results = []
     
@@ -202,7 +202,18 @@ def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool,
             # Send progress message
             progress_queue.put(('progress', os.path.basename(filepath)))
             
-            # Return result
+            # Send result directly to writer queue if available
+            if writer_queue is not None:
+                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                try:
+                    writer_queue.put(output)
+                except Exception as e:
+                    if verbose:
+                        progress_queue.put(('verbose', f"Error sending to writer queue: {e}"))
+            
+            # Return result for backward compatibility
             result = (hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, filepath)
             results.append(result)
             
@@ -228,11 +239,12 @@ class WriterThread:
         self._stop_event = threading.Event()
         self._thread = None
         self._cleanup_done = False
-        self._writer_queue = queue.Queue()
+        self._writer_queue = None  # Will be set to multiprocessing.Queue
         
-    def start(self):
+    def start(self, writer_queue=None):
         """Start the writer thread."""
         self.new_hash_file = self.hash_file + ".new"
+        self._writer_queue = writer_queue
         
         if self.update:
             # Create a new file with algorithm header
@@ -339,6 +351,11 @@ class WriterThread:
             except queue.Empty:
                 # No results available, continue
                 continue
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                # These are expected when the process is terminating
+                if "Broken pipe" not in str(e) and "Connection reset" not in str(e):
+                    print(f"⚠️  Error in writer loop: {e}")
+                continue
             except Exception as e:
                 print(f"⚠️  Error in writer loop: {e}")
                 continue
@@ -395,7 +412,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         workers = min(workers, total_files) if total_files > 0 else 1
 
     # Start the writer thread for parallel processing
-    writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency).start()
+    writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency)
     
     # Use Rich progress bars for parallel processing with individual worker progress
     if show_progress:
@@ -424,6 +441,12 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             with mp.Manager() as manager:
                 progress_queues = [manager.Queue() for _ in range(workers)]
                 worker_completed = manager.list([False] * workers)
+                
+                # Create multiprocessing queue for direct worker-to-writer communication
+                writer_queue = manager.Queue()
+                
+                # Start the writer thread with the multiprocessing queue
+                writer_thread.start(writer_queue)
 
                 # Process files on-the-fly with parallel workers using shared list
                 with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -441,7 +464,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     future_to_worker = {}
                     for worker_id, worker_files in enumerate(worker_file_lists):
                         if worker_files:  # Only create task if worker has files
-                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache)
+                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache, writer_queue)
                             future_to_worker[future] = worker_id
 
                     # Function to monitor progress queues
@@ -478,35 +501,13 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                     monitor_thread.start()
 
-                    # Process results as they complete - send directly to writer thread
+                    # Wait for all workers to complete (results are sent directly to writer queue)
                     for future in as_completed(future_to_worker):
                         worker_id = future_to_worker[future]
                         try:
-                            batch_results = future.result()
-                            for result in batch_results:
-                                if result:
-                                    hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, processed_filename = result
-                                    filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-                                    subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-
-                                    if hashkey in cache:
-                                        if update:
-                                            cache_data = cache.pop(hashkey)
-                                            # Not update mode, just write cached entry
-                                            if len(cache_data) == 5:
-                                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
-                                            else:
-                                                output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                            writer_thread.send_result(output)
-                                        else:
-                                            output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                            writer_thread.send_result(output)
-                                    else:
-                                        # This is the case for new files not in cache
-                                        output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                        writer_thread.send_result(output)
-                            
-                            # Mark worker as completed after processing all results
+                            # Just wait for worker to complete - results are sent directly to writer queue
+                            future.result()
+                            # Mark worker as completed
                             worker_completed[worker_id] = True
                             
                         except Exception as e:
@@ -520,6 +521,38 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
                     # Wait for progress monitoring to complete
                     monitor_thread.join()
+    else:
+        # No progress display - still use multiprocessing queue for direct communication
+        with mp.Manager() as manager:
+            # Create multiprocessing queue for direct worker-to-writer communication
+            writer_queue = manager.Queue()
+            
+            # Start the writer thread with the multiprocessing queue
+            writer_thread.start(writer_queue)
+            
+            # Process files with parallel workers
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                # Collect all files with sizes for balanced distribution
+                all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
+                
+                # Distribute files among workers based on size for balanced workload
+                worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
+                
+                # Submit all worker tasks at once
+                future_to_worker = {}
+                for worker_id, worker_files in enumerate(worker_file_lists):
+                    if worker_files:  # Only create task if worker has files
+                        # Create dummy progress queue for workers
+                        dummy_queue = manager.Queue()
+                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, dummy_queue, cache, writer_queue)
+                        future_to_worker[future] = worker_id
+                
+                # Wait for all workers to complete
+                for future in as_completed(future_to_worker):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Error in worker: {e}")
 
     # Stop the writer thread
     writer_thread.stop()
