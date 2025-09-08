@@ -47,6 +47,9 @@ class HashfileBrowser:
         self.current_dir: Optional[DirEntry] = None
         self.selected_index = 0
         self.scroll_offset = 0
+        # Sorting options
+        self.sort_by_size = False  # False = sort by name, True = sort by size
+        self.show_size_bars = True  # Show/hide size bars
         
     def load_hashfile(self, filepath: str) -> bool:
         """Load and parse a .hashes file."""
@@ -226,27 +229,23 @@ class HashfileBrowser:
         # Clear screen
         print("\033[2J\033[H", end="")
         
-        # Header
+        # Header with sort mode indicator
         path_str = self.current_dir.path or "/"
-        header = f" {path_str} - {self.format_size(self.current_dir.size)} ({self.current_dir.file_count} files)"
+        sort_indicator = "Size" if self.sort_by_size else "Name"
+        header = f" {path_str} - {self.format_size(self.current_dir.size)} ({self.current_dir.file_count} files) [Sort: {sort_indicator}]"
         print(header[:width])
         print("-" * min(len(header), width))
-        
-        # Get items to display
-        items = []
-        
-        # Add parent directory if not at root
-        if self.current_dir.parent:
-            items.append(("../", 0, True, None))
-        
-        # Add subdirectories
-        for subdir in sorted(self.current_dir.subdirs, key=lambda x: x.name.lower()):
-            items.append((f"{subdir.name}/", subdir.size, True, subdir))
-        
-        # Add files
-        for file_entry in sorted(self.current_dir.files, key=lambda x: x.path.lower()):
-            filename = os.path.basename(file_entry.path)
-            items.append((filename, file_entry.size, False, file_entry))
+
+        # Get items to display (now using the centralized method)
+        items = self.get_current_items()
+
+        # Find max size for size bars (excluding parent directory ".." which has size 0)
+        max_size = 0
+        if self.show_size_bars:
+            for item in items:
+                name, size, is_dir, obj = item
+                if size > max_size:
+                    max_size = size
         
         # Calculate display area
         display_height = height - 4  # Header + separator + footer
@@ -263,20 +262,29 @@ class HashfileBrowser:
             if item_index >= len(items):
                 print()
                 continue
-            
+
             name, size, is_dir, obj = items[item_index]
             size_str = self.format_size(size)
-            
+
             # Create line with proper spacing
             marker = ">" if item_index == self.selected_index else " "
-            line = f"{marker} {name:<40} {size_str:>10}"
-            
+
+            if self.show_size_bars and max_size > 0:
+                # Include size bar
+                size_bar = self.create_size_bar(size, max_size, bar_width=10)
+                line = f"{marker} {name:<30} {size_bar} {size_str:>10}"
+            else:
+                # No size bar
+                line = f"{marker} {name:<40} {size_str:>10}"
+
             # Truncate to terminal width
             print(line[:width])
         
         # Footer
         print("-" * min(60, width))
-        print("Use arrows/hjkl/Ctrl+B/F/Space/b to navigate, Enter/l to select, q to quit")
+        sort_mode = "Size" if self.sort_by_size else "Name"
+        bars_status = "ON" if self.show_size_bars else "OFF"
+        print(f"Use arrows/hjkl/Ctrl+B/F/Space/b to navigate, Enter/l to select, s=sort({sort_mode}), g=bars({bars_status}), q=quit")
     
     def get_key(self) -> str:
         """Get a single keypress."""
@@ -324,7 +332,38 @@ class HashfileBrowser:
             self.selected_index -= display_height
 
         self.selected_index = max(0, min(self.selected_index, items_count - 1))
-    
+
+    def create_size_bar(self, size: int, max_size: int, bar_width: int = 10) -> str:
+        """Create a visual size bar like ncdu."""
+        if max_size == 0:
+            return ""
+
+        ratio = size / max_size
+        filled = int(ratio * bar_width)
+
+        # Use different characters for different fill levels
+        if ratio >= 0.9:
+            bar_char = "█"
+        elif ratio >= 0.7:
+            bar_char = "▊"
+        elif ratio >= 0.5:
+            bar_char = "▌"
+        elif ratio >= 0.3:
+            bar_char = "▍"
+        elif ratio >= 0.1:
+            bar_char = "▎"
+        else:
+            bar_char = "▏"
+
+        bar = bar_char * filled
+        remaining = bar_width - filled
+
+        # Add empty space for remaining width
+        if remaining > 0:
+            bar += " " * remaining
+
+        return f"[{bar}]"
+
     def get_current_items(self) -> List:
         """Get list of current directory items."""
         items = []
@@ -332,14 +371,28 @@ class HashfileBrowser:
         if self.current_dir.parent:
             items.append(("../", 0, True, None))
 
-        # Sort subdirectories by name (same as in render_screen)
-        for subdir in sorted(self.current_dir.subdirs, key=lambda x: x.name.lower()):
-            items.append((f"{subdir.name}/", subdir.size, True, subdir))
+        if self.sort_by_size:
+            # Sort by size (descending), then by name for ties
+            def sort_key_dir(x):
+                return (-x.size, x.name.lower())
 
-        # Sort files by name (same as in render_screen)
-        for file_entry in sorted(self.current_dir.files, key=lambda x: x.path.lower()):
-            filename = os.path.basename(file_entry.path)
-            items.append((filename, file_entry.size, False, file_entry))
+            def sort_key_file(x):
+                return (-x.size, x.path.lower())
+
+            for subdir in sorted(self.current_dir.subdirs, key=sort_key_dir):
+                items.append((f"{subdir.name}/", subdir.size, True, subdir))
+
+            for file_entry in sorted(self.current_dir.files, key=sort_key_file):
+                filename = os.path.basename(file_entry.path)
+                items.append((filename, file_entry.size, False, file_entry))
+        else:
+            # Sort by name (ascending)
+            for subdir in sorted(self.current_dir.subdirs, key=lambda x: x.name.lower()):
+                items.append((f"{subdir.name}/", subdir.size, True, subdir))
+
+            for file_entry in sorted(self.current_dir.files, key=lambda x: x.path.lower()):
+                filename = os.path.basename(file_entry.path)
+                items.append((filename, file_entry.size, False, file_entry))
 
         return items
     
@@ -398,6 +451,13 @@ class HashfileBrowser:
                     self.navigate_page(1)
                 elif key == 'b':  # 'b' - Page Up
                     self.navigate_page(-1)
+                # Sorting and display options
+                elif key == 's':  # Toggle sorting mode
+                    self.sort_by_size = not self.sort_by_size
+                    self.selected_index = 0  # Reset selection to top
+                    self.scroll_offset = 0
+                elif key == 'g':  # Toggle size bars
+                    self.show_size_bars = not self.show_size_bars
                 elif key == '\r' or key == '\n':  # Enter
                     self.enter_selected()
                     
