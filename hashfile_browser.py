@@ -18,6 +18,46 @@ except ImportError:
     print("Error: Could not import filehasher. Make sure it's installed.")
     sys.exit(1)
 
+# ANSI Color codes
+class Colors:
+    # Reset
+    RESET = '\033[0m'
+
+    # Regular colors
+    BLACK = '\033[30m'
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    MAGENTA = '\033[35m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
+
+    # Bright colors
+    BRIGHT_BLACK = '\033[90m'
+    BRIGHT_RED = '\033[91m'
+    BRIGHT_GREEN = '\033[92m'
+    BRIGHT_YELLOW = '\033[93m'
+    BRIGHT_BLUE = '\033[94m'
+    BRIGHT_MAGENTA = '\033[95m'
+    BRIGHT_CYAN = '\033[96m'
+    BRIGHT_WHITE = '\033[97m'
+
+    # Background colors
+    BG_BLACK = '\033[40m'
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+    BG_WHITE = '\033[47m'
+
+    # Styles
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    REVERSE = '\033[7m'
+
 
 @dataclass
 class FileEntry:
@@ -233,7 +273,7 @@ class HashfileBrowser:
         path_str = self.current_dir.path or "/"
         sort_indicator = "Size" if self.sort_by_size else "Name"
         header = f" {path_str} - {self.format_size(self.current_dir.size)} ({self.current_dir.file_count} files) [Sort: {sort_indicator}]"
-        print(header[:width])
+        print(self.colorize_header(header[:width]))
         print("-" * min(len(header), width))
 
         # Get items to display (now using the centralized method)
@@ -265,17 +305,24 @@ class HashfileBrowser:
 
             name, size, is_dir, obj = items[item_index]
             size_str = self.format_size(size)
+            is_selected = (item_index == self.selected_index)
 
             # Create line with proper spacing
-            marker = ">" if item_index == self.selected_index else " "
+            marker = ">" if is_selected else " "
+
+            # Colorize the name
+            colored_name = self.colorize_item(name, is_dir, is_selected)
+            colored_size = self.colorize_size(size_str)
 
             if self.show_size_bars and max_size > 0:
-                # Include size bar
+                # Include size bar with color
                 size_bar = self.create_size_bar(size, max_size, bar_width=10)
-                line = f"{marker} {name:<30} {size_bar} {size_str:>10}"
+                ratio = size / max_size if max_size > 0 else 0
+                colored_bar = self.colorize_size_bar(size_bar, ratio)
+                line = f"{marker} {colored_name:<30} {colored_bar} {colored_size:>10}"
             else:
                 # No size bar
-                line = f"{marker} {name:<40} {size_str:>10}"
+                line = f"{marker} {colored_name:<40} {colored_size:>10}"
 
             # Truncate to terminal width
             print(line[:width])
@@ -284,7 +331,8 @@ class HashfileBrowser:
         print("-" * min(60, width))
         sort_mode = "Size" if self.sort_by_size else "Name"
         bars_status = "ON" if self.show_size_bars else "OFF"
-        print(f"Use arrows/hjkl/Ctrl+B/F/Space/b to navigate, Enter/l to select, s=sort({sort_mode}), g=bars({bars_status}), q=quit")
+        footer = f"Use arrows/hjkl/Ctrl+B/F/Space/b to navigate, Enter/l to select, s=sort({sort_mode}), g=bars({bars_status}), q=quit"
+        print(self.colorize_footer(footer))
     
     def get_key(self) -> str:
         """Get a single keypress."""
@@ -363,6 +411,45 @@ class HashfileBrowser:
             bar += " " * remaining
 
         return f"[{bar}]"
+
+    def get_size_bar_color(self, ratio: float) -> str:
+        """Get color for size bar based on size ratio."""
+        if ratio >= 0.8:
+            return Colors.BRIGHT_RED
+        elif ratio >= 0.6:
+            return Colors.BRIGHT_YELLOW
+        elif ratio >= 0.4:
+            return Colors.BRIGHT_GREEN
+        elif ratio >= 0.2:
+            return Colors.BRIGHT_BLUE
+        else:
+            return Colors.BRIGHT_BLACK
+
+    def colorize_item(self, name: str, is_dir: bool, is_selected: bool) -> str:
+        """Colorize item name based on type and selection status."""
+        if is_selected:
+            return f"{Colors.REVERSE}{name}{Colors.RESET}"
+        elif is_dir:
+            return f"{Colors.BRIGHT_BLUE}{Colors.BOLD}{name}{Colors.RESET}"
+        else:
+            return f"{Colors.WHITE}{name}{Colors.RESET}"
+
+    def colorize_size_bar(self, bar: str, ratio: float) -> str:
+        """Colorize size bar with gradient based on size ratio."""
+        color = self.get_size_bar_color(ratio)
+        return f"{color}{bar}{Colors.RESET}"
+
+    def colorize_size(self, size_str: str) -> str:
+        """Colorize file size text."""
+        return f"{Colors.BRIGHT_CYAN}{size_str}{Colors.RESET}"
+
+    def colorize_header(self, header: str) -> str:
+        """Colorize header text."""
+        return f"{Colors.BRIGHT_WHITE}{Colors.BOLD}{header}{Colors.RESET}"
+
+    def colorize_footer(self, footer: str) -> str:
+        """Colorize footer text."""
+        return f"{Colors.DIM}{footer}{Colors.RESET}"
 
     def get_current_items(self) -> List:
         """Get list of current directory items."""
