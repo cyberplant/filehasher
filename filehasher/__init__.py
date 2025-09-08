@@ -352,12 +352,12 @@ class WriterThread:
                 # No results available, continue
                 continue
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                # These are expected when the process is terminating
-                if "Broken pipe" not in str(e) and "Connection reset" not in str(e):
-                    print(f"⚠️  Error in writer loop: {e}")
+                # These are expected when the process is terminating - don't show errors
                 continue
             except Exception as e:
-                print(f"⚠️  Error in writer loop: {e}")
+                # Only show unexpected errors
+                if not self._cleanup_done and str(e).strip():
+                    print(f"⚠️  Error in writer loop: {e}")
                 continue
 
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
@@ -493,6 +493,18 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     except Exception as e:
                                         # Ignore errors during cleanup
                                         pass
+                            
+                            # Process any remaining messages after workers are marked as completed
+                            for worker_id in range(workers):
+                                try:
+                                    while True:
+                                        message = progress_queues[worker_id].get_nowait()
+                                        if message[0] == 'progress':
+                                            progress.update(worker_tasks[worker_id], advance=1)
+                                except queue.Empty:
+                                    break
+                                except Exception:
+                                    break
                         except Exception as e:
                             # Ignore errors during cleanup
                             pass
@@ -507,20 +519,21 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         try:
                             # Just wait for worker to complete - results are sent directly to writer queue
                             future.result()
-                            # Mark worker as completed
-                            worker_completed[worker_id] = True
                             
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
-                            # Mark worker as completed to avoid hanging
-                            try:
-                                worker_completed[worker_id] = True
-                            except Exception:
-                                # Ignore errors when trying to update shared objects during cleanup
-                                pass
+                    
+                    # Mark all workers as completed after all futures are done
+                    for worker_id in range(workers):
+                        worker_completed[worker_id] = True
 
                     # Wait for progress monitoring to complete
-                    monitor_thread.join()
+                    monitor_thread.join(timeout=1.0)
+                    
+                    # Ensure all progress bars show 100% completion
+                    for i, worker_files in enumerate(worker_file_lists):
+                        if worker_files:
+                            progress.update(worker_tasks[i], completed=len(worker_files))
     else:
         # No progress display - still use multiprocessing queue for direct communication
         with mp.Manager() as manager:
