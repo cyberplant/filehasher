@@ -23,7 +23,6 @@ except ImportError:
 
 # Constants
 DEFAULT_ALGORITHM = "md5"
-MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB
 CONFIG_FILE = os.path.expanduser("~/.filehasher")
 
 # Supported algorithms
@@ -95,13 +94,9 @@ def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: b
             if filename.startswith('.'):
                 continue
             
-            # Skip files that are too large
+            # Get file size
             try:
                 file_size = os.path.getsize(filepath)
-                if file_size > MAX_FILE_SIZE:
-                    if verbose:
-                        print(f"Skipping large file: {filepath} ({file_size/1024/1024:.1f}MB)")
-                    continue
             except OSError as e:
                 if verbose:
                     print(f"Skipping inaccessible file: {filepath} ({e})")
