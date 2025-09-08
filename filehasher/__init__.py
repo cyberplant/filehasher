@@ -626,18 +626,21 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                         if len(results_buffer) >= write_frequency:
                                             file_writer.write_results(results_buffer)
                                             results_buffer = []
-
                             except Exception as e:
                                 print(f"Error in worker {worker_id}: {e}")
                                 # Mark worker as completed to avoid hanging
-                                worker_completed[worker_id] = True
+                                try:
+                                    worker_completed[worker_id] = True
+                                except Exception:
+                                    # Ignore errors when trying to update shared objects during cleanup
+                                    pass
                     
-                        # Write any remaining results
-                        if results_buffer:
-                            file_writer.write_results(results_buffer)
+                    # Write any remaining results
+                    if results_buffer:
+                        file_writer.write_results(results_buffer)
 
-                        # Wait for progress monitoring to complete
-                        monitor_thread.join()
+                    # Wait for progress monitoring to complete
+                    monitor_thread.join()
 
         elif parallel and show_progress and HAS_TQDM:
             # Fallback to tqdm for parallel processing with progress queues
@@ -749,7 +752,11 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
                             # Mark worker as completed to avoid hanging
-                            worker_completed[worker_id] = True
+                            try:
+                                worker_completed[worker_id] = True
+                            except Exception:
+                                # Ignore errors when trying to update shared objects during cleanup
+                                pass
                 
                     # Write any remaining results
                     if results_buffer:
@@ -1072,7 +1079,16 @@ class HashFileWriter:
         print(f"\n⚠️  Process interrupted (signal {signum}). Saving progress...")
         # Don't call sys.exit() here as it can cause threading issues
         # Just do cleanup and let the main process handle the exit
-        self._cleanup()
+        try:
+            self._cleanup()
+        except Exception as e:
+            print(f"⚠️  Error during signal cleanup: {e}")
+            # Try to at least flush the file if possible
+            try:
+                if self.outfile:
+                    self.outfile.flush()
+            except Exception:
+                pass
     
     def _cleanup(self):
         """Clean up file handles and rename if needed."""
