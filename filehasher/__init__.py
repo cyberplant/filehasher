@@ -8,6 +8,7 @@ import queue
 import configparser
 import signal
 import atexit
+import threading
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
 import multiprocessing as mp
@@ -481,20 +482,22 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
     # Count total files first for progress tracking (much faster than collecting all)
     total_files = _collect_files(hash_file, collect_paths=False, directory=directory)
 
-    # Use HashFileWriter context manager for proper file handling
-    with HashFileWriter(hash_file, update, append, algorithm) as file_writer:
-
-        # Determine number of workers
-        if parallel:
-            if workers is None:
-                workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
-            else:
-                workers = min(workers, total_files) if total_files > 0 else 1
+    # Determine number of workers
+    if parallel:
+        if workers is None:
+            workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
         else:
-            workers = 1
+            workers = min(workers, total_files) if total_files > 0 else 1
+    else:
+        workers = 1
 
+    # Use WriterThread for parallel processing, HashFileWriter for sequential
+    if parallel:
+        # Start the writer thread for parallel processing
+        writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency).start()
+        
         # Use Rich progress bars for parallel processing with individual worker progress
-        if parallel and show_progress and HAS_RICH:
+        if show_progress and HAS_RICH:
             import threading
             console = Console()
 
@@ -588,9 +591,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                         monitor_thread.start()
 
-                        # Process results as they complete with incremental writing
-                        results_buffer = []
-                        results_written = 0
+                        # Process results as they complete - send directly to writer thread
                     
                         for future in as_completed(future_to_worker):
                             worker_id = future_to_worker[future]
@@ -617,15 +618,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                     output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                                 else:
                                                     output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                                results_buffer.append(output)
+                                                writer_thread.send_result(output)
                                         else:
                                             output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                            results_buffer.append(output)
-                                    
-                                        # Write to file periodically
-                                        if len(results_buffer) >= write_frequency:
-                                            file_writer.write_results(results_buffer)
-                                            results_buffer = []
+                                            writer_thread.send_result(output)
                             except Exception as e:
                                 print(f"Error in worker {worker_id}: {e}")
                                 # Mark worker as completed to avoid hanging
@@ -634,10 +630,6 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 except Exception:
                                     # Ignore errors when trying to update shared objects during cleanup
                                     pass
-                    
-                    # Write any remaining results
-                    if results_buffer:
-                        file_writer.write_results(results_buffer)
 
                     # Wait for progress monitoring to complete
                     monitor_thread.join()
@@ -710,9 +702,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                     monitor_thread.start()
 
-                    # Process results with incremental writing
-                    results_buffer = []
-                    results_written = 0
+                    # Process results - send directly to writer thread
                 
                     for future in as_completed(future_to_worker):
                         worker_id = future_to_worker[future]
@@ -739,15 +729,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                                             else:
                                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                            results_buffer.append(output)
+                                            writer_thread.send_result(output)
                                     else:
                                         output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                        results_buffer.append(output)
-                                
-                                    # Write to file periodically
-                                    if len(results_buffer) >= write_frequency:
-                                        file_writer.write_results(results_buffer)
-                                        results_buffer = []
+                                        writer_thread.send_result(output)
 
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
@@ -757,15 +742,15 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             except Exception:
                                 # Ignore errors when trying to update shared objects during cleanup
                                 pass
-                
-                    # Write any remaining results
-                    if results_buffer:
-                        file_writer.write_results(results_buffer)
 
                     # Wait for progress monitoring to complete
                     monitor_thread.join()
 
             progress_bar.close()
+        
+        # Stop the writer thread for parallel processing
+        if parallel:
+            writer_thread.stop()
 
         else:
             # Sequential processing (original logic)
@@ -852,6 +837,9 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
             if progress_bar:
                 progress_bar.close()
+            
+            # Cleanup for sequential processing
+            file_writer.__exit__(None, None, None)
 
 
 def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
@@ -1047,12 +1035,31 @@ class HashFileWriter:
         self.new_hash_file = None
         self.results_written = 0
         self._cleanup_done = False
+
+
+class WriterThread:
+    """Dedicated thread for writing hash results to file."""
+    
+    def __init__(self, hash_file: str, update: bool, append: bool, algorithm: str, write_frequency: int = 100):
+        self.hash_file = hash_file
+        self.update = update
+        self.append = append
+        self.algorithm = algorithm
+        self.write_frequency = write_frequency
+        self.outfile = None
+        self.new_hash_file = None
+        self.results_written = 0
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._cleanup_done = False
+        self._writer_queue = queue.Queue()
         
-    def __enter__(self):
+    def start(self):
+        """Start the writer thread."""
         self.new_hash_file = self.hash_file + ".new"
         
         if self.update:
-            # Create a new file with algorithm header and only needed hashes
+            # Create a new file with algorithm header
             self.outfile = _asserted_open(self.new_hash_file, "w")
             self.outfile.write(f"# Algorithm: {self.algorithm}\n")
         else:
@@ -1069,26 +1076,35 @@ class HashFileWriter:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
+        # Start the writer thread
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+        
         return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def stop(self):
+        """Stop the writer thread."""
+        self._stop_event.set()
+        # Send sentinel value to stop the writer loop
+        try:
+            self._writer_queue.put(None)
+        except Exception:
+            pass
+        if self._thread:
+            self._thread.join(timeout=2)
         self._cleanup()
+    
+    def send_result(self, result_data: str):
+        """Send a result to the writer thread."""
+        try:
+            self._writer_queue.put(result_data)
+        except Exception as e:
+            print(f"⚠️  Error sending result to writer: {e}")
     
     def _signal_handler(self, signum, frame):
         """Handle interruption signals."""
         print(f"\n⚠️  Process interrupted (signal {signum}). Saving progress...")
-        # Don't call sys.exit() here as it can cause threading issues
-        # Just do cleanup and let the main process handle the exit
-        try:
-            self._cleanup()
-        except Exception as e:
-            print(f"⚠️  Error during signal cleanup: {e}")
-            # Try to at least flush the file if possible
-            try:
-                if self.outfile:
-                    self.outfile.flush()
-            except Exception:
-                pass
+        self._cleanup()
     
     def _cleanup(self):
         """Clean up file handles and rename if needed."""
@@ -1118,12 +1134,48 @@ class HashFileWriter:
         finally:
             self.outfile = None
     
-    def write_results(self, results_buffer: List[str]) -> None:
-        """Write buffered results to file."""
+    def write_result(self, result_data: str):
+        """Write a single result to the file."""
         if not self.outfile or self._cleanup_done:
             return
             
-        for output_line in results_buffer:
-            self.outfile.write(output_line + "\n")
-        self.outfile.flush()  # Ensure data is written to disk
-        self.results_written += len(results_buffer)
+        try:
+            self.outfile.write(result_data + "\n")
+            self.results_written += 1
+            
+            # Flush periodically
+            if self.results_written % self.write_frequency == 0:
+                self.outfile.flush()
+        except Exception as e:
+            print(f"⚠️  Error writing result: {e}")
+    
+    def _writer_loop(self):
+        """Main writer loop that processes results from the queue."""
+        while not self._stop_event.is_set():
+            try:
+                # Get result from queue with timeout
+                result_data = self._writer_queue.get(timeout=0.1)
+                if result_data is None:  # Sentinel value to stop
+                    break
+                    
+                # Write the result to file
+                if not self.outfile or self._cleanup_done:
+                    continue
+                    
+                try:
+                    self.outfile.write(result_data + "\n")
+                    self.results_written += 1
+                    
+                    # Flush periodically
+                    if self.results_written % self.write_frequency == 0:
+                        self.outfile.flush()
+                except Exception as e:
+                    print(f"⚠️  Error writing result: {e}")
+                    
+                self._writer_queue.task_done()
+            except queue.Empty:
+                # No results available, continue
+                continue
+            except Exception as e:
+                print(f"⚠️  Error in writer loop: {e}")
+                continue
