@@ -469,7 +469,24 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     # Function to monitor progress queues
                     def monitor_progress():
                         try:
-                            while not all(worker_completed):
+                            # Keep monitoring until all workers are actually completed
+                            while True:
+                                # Check if all workers are completed
+                                if all(worker_completed):
+                                    # Process any remaining messages before exiting
+                                    for worker_id in range(workers):
+                                        try:
+                                            while True:
+                                                message = progress_queues[worker_id].get_nowait()
+                                                if message[0] == 'progress':
+                                                    progress.update(worker_tasks[worker_id], advance=1)
+                                        except queue.Empty:
+                                            break
+                                        except Exception:
+                                            break
+                                    break
+                                
+                                # Process messages from active workers
                                 for worker_id in range(workers):
                                     if worker_completed[worker_id]:
                                         continue
@@ -492,18 +509,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     except Exception as e:
                                         # Ignore errors during cleanup
                                         pass
-                            
-                            # Process any remaining messages after workers are marked as completed
-                            for worker_id in range(workers):
-                                try:
-                                    while True:
-                                        message = progress_queues[worker_id].get_nowait()
-                                        if message[0] == 'progress':
-                                            progress.update(worker_tasks[worker_id], advance=1)
-                                except queue.Empty:
-                                    break
-                                except Exception:
-                                    break
+                                
+                                # Small delay to prevent busy waiting
+                                import time
+                                time.sleep(0.01)
                         except Exception as e:
                             # Ignore errors during cleanup
                             pass
@@ -513,6 +522,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     monitor_thread.start()
 
                     # Wait for all workers to complete (results are sent directly to writer queue)
+                    completed_workers = 0
                     for future in as_completed(future_to_worker):
                         worker_id = future_to_worker[future]
                         try:
@@ -520,19 +530,32 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             future.result()
                             # Mark this specific worker as completed
                             worker_completed[worker_id] = True
+                            completed_workers += 1
+                            if verbose:
+                                print(f"Worker {worker_id+1} completed ({completed_workers}/{workers})")
                             
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
                             # Mark this specific worker as completed even if it errored
                             worker_completed[worker_id] = True
+                            completed_workers += 1
 
-                    # Wait for progress monitoring to complete
-                    monitor_thread.join(timeout=1.0)
+                    # Wait for progress monitoring to complete (no timeout to ensure it finishes)
+                    monitor_thread.join()
                     
                     # Ensure all progress bars show 100% completion
                     for i, worker_files in enumerate(worker_file_lists):
                         if worker_files:
                             progress.update(worker_tasks[i], completed=len(worker_files))
+                    
+                    # Wait for writer queue to be empty to ensure all results are processed
+                    if verbose:
+                        print("Waiting for writer queue to empty...")
+                    while not writer_queue.empty():
+                        import time
+                        time.sleep(0.1)
+                    if verbose:
+                        print("Writer queue is empty, all results processed.")
     else:
         # No progress display - still use multiprocessing queue for direct communication
         with mp.Manager() as manager:
