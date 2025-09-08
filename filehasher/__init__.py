@@ -361,16 +361,6 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         write_frequency: Write to file every N entries (default: 100)
     """
     # Set up signal handling for graceful shutdown
-    import atexit
-    
-    def cleanup_and_exit():
-        print("\n⚠️  Process interrupted. Shutting down...")
-        os._exit(1)
-    
-    # Register cleanup function
-    atexit.register(cleanup_and_exit)
-    
-    # Set up signal handlers
     def signal_handler(signum, frame):
         print(f"\n⚠️  Process interrupted (signal {signum}). Shutting down...")
         os._exit(1)
@@ -511,6 +501,14 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                         else:
                                             output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
                                             writer_thread.send_result(output)
+                                    else:
+                                        # This is the case for new files not in cache
+                                        output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                                        writer_thread.send_result(output)
+                            
+                            # Mark worker as completed after processing all results
+                            worker_completed[worker_id] = True
+                            
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
                             # Mark worker as completed to avoid hanging
