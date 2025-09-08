@@ -58,7 +58,7 @@ def _calculate_hash(filepath: str, algorithm: str, verbose: bool = False) -> str
     """Calculate hash of a file."""
     hash_func = ALGORITHMS[algorithm]
     hasher = hash_func()
-    
+
     try:
         with open(filepath, 'rb') as f:
             while True:
@@ -66,11 +66,14 @@ def _calculate_hash(filepath: str, algorithm: str, verbose: bool = False) -> str
                 if not chunk:
                     break
                 hasher.update(chunk)
+                # Add small artificial delay to make progress more visible
+                import time
+                time.sleep(0.001)
     except OSError as e:
         if verbose:
             print(f"Error reading {filepath}: {e}")
         raise
-    
+
     return hasher.hexdigest()
 
 def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False, directory: Optional[str] = None, verbose: bool = False) -> Union[int, List[Tuple[str, int]]]:
@@ -167,7 +170,7 @@ def _can_skip_file(hashkey: str, file_size: int, file_inode: int, file_mtime: fl
 def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue, cache: Dict, writer_queue=None) -> List[Tuple]:
     """Process a batch of files in a worker process."""
     results = []
-    
+
     for filepath in worker_files:
         try:
             # Get file metadata
@@ -183,8 +186,8 @@ def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool,
             if _can_skip_file(hashkey, file_size, file_inode, file_mtime, cache, file_stat):
                 if verbose:
                     progress_queue.put(('verbose', f"Skipped {os.path.basename(filepath)}"))
-                continue
-            
+            continue
+
             # Send start processing message
             progress_queue.put(('start_processing', os.path.basename(filepath)))
             
@@ -220,7 +223,7 @@ def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool,
             if verbose:
                 progress_queue.put(('verbose', f"Error processing {filepath}: {e}"))
             continue
-    
+
     return results
 
 class WriterThread:
@@ -335,7 +338,7 @@ class WriterThread:
                 # Write the result to file
                 if not self.outfile or self._cleanup_done:
                     continue
-                    
+
                 try:
                     self.outfile.write(result_data + "\n")
                     self.results_written += 1
@@ -412,7 +415,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
     # Start the writer thread for parallel processing
     writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency)
-    
+
     # Use Rich progress bars for parallel processing with individual worker progress
     if show_progress:
         import threading
@@ -427,8 +430,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             TextColumn("({task.completed}/{task.total})"),
             TextColumn("[dim]{task.fields[filename]}"),
             console=console,
-            refresh_per_second=100,  # Much higher refresh rate for real-time updates
-            auto_refresh=True,
+            refresh_per_second=10,
         ) as progress:
             # Create progress tasks for each worker with correct totals
             worker_tasks = []
@@ -500,11 +502,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
                                         elif message[0] == 'progress':
                                             # Worker completed a file
-                                            progress.update(worker_tasks[worker_id], advance=1)
-                                            # Force console update every 100 files for more responsive display
-                                            current_completed = progress.tasks[worker_tasks[worker_id]].completed
-                                            if current_completed % 100 == 0:
-                                                console.print(f"\r", end="")
+                                            progress.update(worker_tasks[worker_id], advance=1, filename=message[1])
                                         elif message[0] == 'verbose':
                                             # Verbose message from worker - show in progress bar description
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}: {message[1]}")
@@ -516,7 +514,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 
                                 # Small delay to prevent busy waiting
                                 import time
-                                time.sleep(0)
+                                time.sleep(0.01)  # Small delay to throttle progress updates
                         except Exception as e:
                             # Ignore errors during cleanup
                             pass
@@ -537,7 +535,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             completed_workers += 1
                             if verbose:
                                 print(f"Worker {worker_id+1} completed ({completed_workers}/{workers})")
-                            
+
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
                             # Mark this specific worker as completed even if it errored
@@ -546,7 +544,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
                     # Wait for progress monitoring to complete (no timeout to ensure it finishes)
                     monitor_thread.join()
-                    
+
                     # Ensure all progress bars show 100% completion
                     for i, worker_files in enumerate(worker_file_lists):
                         if worker_files:
@@ -585,7 +583,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         dummy_queue = manager.Queue()
                         future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, dummy_queue, cache, writer_queue)
                         future_to_worker[future] = worker_id
-                
+
                 # Wait for all workers to complete
                 for future in as_completed(future_to_worker):
                     try:
@@ -625,7 +623,7 @@ def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
                 file_size = int(parts[4])
                 file_inode = int(parts[5]) if len(parts) > 5 else 0
                 file_mtime = float(parts[6]) if len(parts) > 6 else 0
-                
+
                 destDict[hashkey] = (hexdigest, subdir, filename, file_size, file_inode, file_mtime)
 
     return destDict, algorithm
@@ -696,7 +694,7 @@ def benchmark_algorithms(test_file: Optional[str] = None, algorithms: Optional[L
     for algorithm in algorithms:
         if algorithm not in ALGORITHMS:
             continue
-            
+
         times = []
         for _ in range(iterations):
             start_time = time.time()
