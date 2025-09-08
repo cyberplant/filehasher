@@ -426,10 +426,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         print(f"DEBUG: Found {total_files} total files to process")
 
     # Determine number of workers (always use parallel, default to 1 worker if not specified)
-    if workers is None:
-        workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
-    else:
-        workers = min(workers, total_files) if total_files > 0 else 1
+        if workers is None:
+            workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
+        else:
+            workers = min(workers, total_files) if total_files > 0 else 1
 
     # Start the writer thread for parallel processing
     writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency)
@@ -487,9 +487,11 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                             future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache, writer_queue, debug)
                             future_to_worker[future] = worker_id
 
-                    # Function to monitor progress queues
+                    # Function to monitor progress queues with batching for better UI sync
                     def monitor_progress():
                         try:
+                            import time
+
                             # Keep monitoring until all workers are actually completed
                             while True:
                                 # Check if all workers are completed
@@ -501,16 +503,17 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                 message = progress_queues[worker_id].get_nowait()
                                                 if message[0] == 'progress':
                                                     progress.update(worker_tasks[worker_id], advance=1)
+                                                    progress.refresh()
                                         except queue.Empty:
                                             break
                                         except Exception:
                                             break
                                     break
-                                
+
                                 # Process messages from ALL workers (not just active ones)
                                 for worker_id in range(workers):
                                     try:
-                                        # Use blocking get with timeout for more responsive progress updates
+                                        # Use blocking get with timeout
                                         message = progress_queues[worker_id].get(timeout=0.001)
                                         if message[0] == 'start_processing':
                                             # Worker started processing a file
@@ -519,8 +522,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                             # Worker is processing a file
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
                                         elif message[0] == 'progress':
-                                            # Worker completed a file
+                                            # Update progress immediately for better responsiveness
                                             progress.update(worker_tasks[worker_id], advance=1, filename=message[1])
+                                            # Force refresh to ensure immediate display
+                                            progress.refresh()
                                         elif message[0] == 'verbose':
                                             # Verbose message from worker - show in progress bar description
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}: {message[1]}")
@@ -529,10 +534,9 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     except Exception as e:
                                         # Ignore errors during cleanup
                                         pass
-                                
+
                                 # Small delay to prevent busy waiting
-                                import time
-                                time.sleep(0.01)  # Small delay to throttle progress updates
+                                time.sleep(0.001)
                         except Exception as e:
                             # Ignore errors during cleanup
                             pass
