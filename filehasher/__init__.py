@@ -6,6 +6,8 @@ import sys
 import time
 import queue
 import configparser
+import signal
+import atexit
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
 import multiprocessing as mp
@@ -476,78 +478,181 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 print("   Operation cancelled.")
                 return
 
-    new_hash_file = hash_file + ".new"
-
-    if update:
-        # Create a new file with algorithm header and only needed hashes
-        outfile = _asserted_open(new_hash_file, "w")
-        outfile.write(f"# Algorithm: {algorithm}\n")
-    else:
-        if append:
-            # Only appends new hashes
-            outfile = _asserted_open(hash_file, "a")
-        else:
-            # Create a new file with algorithm header
-            outfile = _asserted_open(hash_file, "w")
-            outfile.write(f"# Algorithm: {algorithm}\n")
-
     # Count total files first for progress tracking (much faster than collecting all)
     total_files = _collect_files(hash_file, collect_paths=False, directory=directory)
 
+    # Use HashFileWriter context manager for proper file handling
+    with HashFileWriter(hash_file, update, append, algorithm) as file_writer:
 
-    # Determine number of workers
-    if parallel:
-        if workers is None:
-            workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
+        # Determine number of workers
+        if parallel:
+            if workers is None:
+                workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
+            else:
+                workers = min(workers, total_files) if total_files > 0 else 1
         else:
-            workers = min(workers, total_files) if total_files > 0 else 1
-    else:
-        workers = 1
+            workers = 1
 
-    # Use Rich progress bars for parallel processing with individual worker progress
-    if parallel and show_progress and HAS_RICH:
-        import threading
-        console = Console()
+        # Use Rich progress bars for parallel processing with individual worker progress
+        if parallel and show_progress and HAS_RICH:
+            import threading
+            console = Console()
 
-        # Create individual progress bars for each worker
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("({task.completed}/{task.total})"),
-            TextColumn("[dim]{task.fields[filename]}"),
-            console=console,
-            refresh_per_second=10,
-        ) as progress:
-            # Create progress tasks for each worker with correct totals
-            worker_tasks = []
-            # We'll update these totals after we know the actual distribution
-            for i in range(workers):
-                task = progress.add_task(f"Worker {i+1}", total=0, filename="")
-                worker_tasks.append(task)
+            # Create individual progress bars for each worker
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("({task.completed}/{task.total})"),
+                TextColumn("[dim]{task.fields[filename]}"),
+                console=console,
+                refresh_per_second=10,
+            ) as progress:
+                # Create progress tasks for each worker with correct totals
+                worker_tasks = []
+                # We'll update these totals after we know the actual distribution
+                for i in range(workers):
+                    task = progress.add_task(f"Worker {i+1}", total=0, filename="")
+                    worker_tasks.append(task)
+
+                # Create progress queues for real-time updates using Manager
+                with mp.Manager() as manager:
+                    progress_queues = [manager.Queue() for _ in range(workers)]
+                    worker_completed = manager.list([False] * workers)
+
+                    # Process files on-the-fly with parallel workers using shared list
+                    with ProcessPoolExecutor(max_workers=workers) as executor:
+                        # Collect all files with sizes for balanced distribution
+                        all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
+
+                        # Distribute files among workers based on size for balanced workload
+                        worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
+
+                        # Update progress bar totals with actual file counts per worker
+                        for i, worker_files in enumerate(worker_file_lists):
+                            progress.update(worker_tasks[i], total=len(worker_files))
+
+                        # Submit all worker tasks at once
+                        future_to_worker = {}
+                        for worker_id, worker_files in enumerate(worker_file_lists):
+                            if worker_files:  # Only create task if worker has files
+                                future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache)
+                                future_to_worker[future] = worker_id
+
+                        # Function to monitor progress queues
+                        def monitor_progress():
+                            while not all(worker_completed):
+                                for worker_id in range(workers):
+                                    if worker_completed[worker_id]:
+                                        continue
+                                    try:
+                                        message = progress_queues[worker_id].get_nowait()
+                                        if message[0] == 'progress':
+                                            _, wid, advance, filename = message
+                                            progress.update(worker_tasks[wid], advance=advance,
+                                                          filename=os.path.basename(filename) if verbose and filename else "")
+                                        elif message[0] == 'start_processing':
+                                            _, wid, advance, filename = message
+                                            # Update the display to show the file that's about to be processed
+                                            progress.update(worker_tasks[wid], advance=advance,
+                                                          filename=f"Starting: {os.path.basename(filename)}" if verbose and filename else "")
+                                        elif message[0] == 'processing':
+                                            _, wid, advance, filename, bytes_read = message
+                                            # Show the file currently being processed with bytes read
+                                            if verbose and filename:
+                                                size_mb = bytes_read / (1024 * 1024)
+                                                progress.update(worker_tasks[wid], advance=advance,
+                                                              filename=f"Processing: {os.path.basename(filename)} ({size_mb:.1f}MB)")
+                                        elif message[0] == 'verbose':
+                                            _, wid, advance, verbose_msg = message
+                                            # Show verbose messages in the progress bar
+                                            if verbose:
+                                                progress.update(worker_tasks[wid], advance=advance,
+                                                              filename=verbose_msg)
+                                        elif message[0] == 'done':
+                                            worker_completed[message[1]] = True
+                                    except queue.Empty:
+                                        # Queue is empty, continue monitoring
+                                        pass
+                                time.sleep(0)  # Yield control to avoid busy waiting
+
+                        # Start progress monitoring thread
+                        monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+                        monitor_thread.start()
+
+                        # Process results as they complete with incremental writing
+                        results_buffer = []
+                        results_written = 0
+                    
+                        for future in as_completed(future_to_worker):
+                            worker_id = future_to_worker[future]
+                            try:
+                                batch_results = future.result()
+                                for result in batch_results:
+                                    if result:
+                                        hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, processed_filename = result
+                                        filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                                        subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+
+                                        if hashkey in cache:
+                                            if update:
+                                                cache_data = cache.pop(hashkey)
+                                                # Handle both old format (5 fields) and new format (6 fields)
+                                                if len(cache_data) == 5:
+                                                    output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                                else:
+                                                    output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
+                                                results_buffer.append(output)
+                                            else:
+                                                # Not update mode, just write cached entry
+                                                if len(cache_data) == 5:
+                                                    output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                                else:
+                                                    output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
+                                                results_buffer.append(output)
+                                        else:
+                                            output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                                            results_buffer.append(output)
+                                    
+                                        # Write to file periodically
+                                        if len(results_buffer) >= write_frequency:
+                                            file_writer.write_results(results_buffer)
+                                            results_buffer = []
+
+                            except Exception as e:
+                                print(f"Error in worker {worker_id}: {e}")
+                                # Mark worker as completed to avoid hanging
+                                worker_completed[worker_id] = True
+                    
+                        # Write any remaining results
+                        if results_buffer:
+                            file_writer.write_results(results_buffer)
+
+                        # Wait for progress monitoring to complete
+                        monitor_thread.join()
+
+        elif parallel and show_progress and HAS_TQDM:
+            # Fallback to tqdm for parallel processing with progress queues
+            import threading
+            progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
+
+            # Collect all files with sizes for balanced distribution
+            all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
+
+            # Distribute files among workers based on size for balanced workload
+            worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
 
             # Create progress queues for real-time updates using Manager
             with mp.Manager() as manager:
                 progress_queues = [manager.Queue() for _ in range(workers)]
                 worker_completed = manager.list([False] * workers)
 
-                # Process files on-the-fly with parallel workers using shared list
                 with ProcessPoolExecutor(max_workers=workers) as executor:
-                    # Collect all files with sizes for balanced distribution
-                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
-
-                    # Distribute files among workers based on size for balanced workload
-                    worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
-
-                    # Update progress bar totals with actual file counts per worker
-                    for i, worker_files in enumerate(worker_file_lists):
-                        progress.update(worker_tasks[i], total=len(worker_files))
-
-                    # Submit all worker tasks at once
+                    # Submit worker tasks
                     future_to_worker = {}
                     for worker_id, worker_files in enumerate(worker_file_lists):
-                        if worker_files:  # Only create task if worker has files
+                        if worker_files:
                             future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache)
                             future_to_worker[future] = worker_id
 
@@ -561,26 +666,22 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     message = progress_queues[worker_id].get_nowait()
                                     if message[0] == 'progress':
                                         _, wid, advance, filename = message
-                                        progress.update(worker_tasks[wid], advance=advance,
-                                                      filename=os.path.basename(filename) if verbose and filename else "")
+                                        if verbose and filename:
+                                            progress_bar.set_description(f"Worker {wid+1}: Completed {os.path.basename(filename)}")
+                                        progress_bar.update(advance)
                                     elif message[0] == 'start_processing':
                                         _, wid, advance, filename = message
-                                        # Update the display to show the file that's about to be processed
-                                        progress.update(worker_tasks[wid], advance=advance,
-                                                      filename=f"Starting: {os.path.basename(filename)}" if verbose and filename else "")
+                                        if verbose and filename:
+                                            progress_bar.set_description(f"Worker {wid+1}: Starting {os.path.basename(filename)}")
                                     elif message[0] == 'processing':
                                         _, wid, advance, filename, bytes_read = message
-                                        # Show the file currently being processed with bytes read
                                         if verbose and filename:
                                             size_mb = bytes_read / (1024 * 1024)
-                                            progress.update(worker_tasks[wid], advance=advance,
-                                                          filename=f"Processing: {os.path.basename(filename)} ({size_mb:.1f}MB)")
+                                            progress_bar.set_description(f"Worker {wid+1}: Processing {os.path.basename(filename)} ({size_mb:.1f}MB)")
                                     elif message[0] == 'verbose':
                                         _, wid, advance, verbose_msg = message
-                                        # Show verbose messages in the progress bar
                                         if verbose:
-                                            progress.update(worker_tasks[wid], advance=advance,
-                                                          filename=verbose_msg)
+                                            progress_bar.set_description(f"Worker {wid+1}: {verbose_msg}")
                                     elif message[0] == 'done':
                                         worker_completed[message[1]] = True
                                 except queue.Empty:
@@ -592,10 +693,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                     monitor_thread.start()
 
-                    # Process results as they complete with incremental writing
+                    # Process results with incremental writing
                     results_buffer = []
                     results_written = 0
-                    
+                
                     for future in as_completed(future_to_worker):
                         worker_id = future_to_worker[future]
                         try:
@@ -625,244 +726,111 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     else:
                                         output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
                                         results_buffer.append(output)
-                                    
+                                
                                     # Write to file periodically
                                     if len(results_buffer) >= write_frequency:
-                                        for output_line in results_buffer:
-                                            outfile.write(output_line + "\n")
-                                        outfile.flush()  # Ensure data is written to disk
-                                        results_written += len(results_buffer)
+                                        file_writer.write_results(results_buffer)
                                         results_buffer = []
 
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
                             # Mark worker as completed to avoid hanging
                             worker_completed[worker_id] = True
-                    
+                
                     # Write any remaining results
                     if results_buffer:
-                        for output_line in results_buffer:
-                            outfile.write(output_line + "\n")
-                        outfile.flush()
-                        results_written += len(results_buffer)
+                        file_writer.write_results(results_buffer)
 
                     # Wait for progress monitoring to complete
                     monitor_thread.join()
 
-    elif parallel and show_progress and HAS_TQDM:
-        # Fallback to tqdm for parallel processing with progress queues
-        import threading
-        progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
+            progress_bar.close()
 
-        # Collect all files with sizes for balanced distribution
-        all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
-
-        # Distribute files among workers based on size for balanced workload
-        worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
-
-        # Create progress queues for real-time updates using Manager
-        with mp.Manager() as manager:
-            progress_queues = [manager.Queue() for _ in range(workers)]
-            worker_completed = manager.list([False] * workers)
-
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Submit worker tasks
-                future_to_worker = {}
-                for worker_id, worker_files in enumerate(worker_file_lists):
-                    if worker_files:
-                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache)
-                        future_to_worker[future] = worker_id
-
-                # Function to monitor progress queues
-                def monitor_progress():
-                    while not all(worker_completed):
-                        for worker_id in range(workers):
-                            if worker_completed[worker_id]:
-                                continue
-                            try:
-                                message = progress_queues[worker_id].get_nowait()
-                                if message[0] == 'progress':
-                                    _, wid, advance, filename = message
-                                    if verbose and filename:
-                                        progress_bar.set_description(f"Worker {wid+1}: Completed {os.path.basename(filename)}")
-                                    progress_bar.update(advance)
-                                elif message[0] == 'start_processing':
-                                    _, wid, advance, filename = message
-                                    if verbose and filename:
-                                        progress_bar.set_description(f"Worker {wid+1}: Starting {os.path.basename(filename)}")
-                                elif message[0] == 'processing':
-                                    _, wid, advance, filename, bytes_read = message
-                                    if verbose and filename:
-                                        size_mb = bytes_read / (1024 * 1024)
-                                        progress_bar.set_description(f"Worker {wid+1}: Processing {os.path.basename(filename)} ({size_mb:.1f}MB)")
-                                elif message[0] == 'verbose':
-                                    _, wid, advance, verbose_msg = message
-                                    if verbose:
-                                        progress_bar.set_description(f"Worker {wid+1}: {verbose_msg}")
-                                elif message[0] == 'done':
-                                    worker_completed[message[1]] = True
-                            except queue.Empty:
-                                # Queue is empty, continue monitoring
-                                pass
-                        time.sleep(0)  # Yield control to avoid busy waiting
-
-                # Start progress monitoring thread
-                monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
-                monitor_thread.start()
-
-                # Process results with incremental writing
-                results_buffer = []
-                results_written = 0
-                
-                for future in as_completed(future_to_worker):
-                    worker_id = future_to_worker[future]
-                    try:
-                        batch_results = future.result()
-                        for result in batch_results:
-                            if result:
-                                hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, processed_filename = result
-                                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-                                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-
-                                if hashkey in cache:
-                                    if update:
-                                        cache_data = cache.pop(hashkey)
-                                        # Handle both old format (5 fields) and new format (6 fields)
-                                        if len(cache_data) == 5:
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
-                                        else:
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                        results_buffer.append(output)
-                                    else:
-                                        # Not update mode, just write cached entry
-                                        if len(cache_data) == 5:
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
-                                        else:
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                                        results_buffer.append(output)
-                                else:
-                                    output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                    results_buffer.append(output)
-                                
-                                # Write to file periodically
-                                if len(results_buffer) >= write_frequency:
-                                    for output_line in results_buffer:
-                                        outfile.write(output_line + "\n")
-                                    outfile.flush()  # Ensure data is written to disk
-                                    results_written += len(results_buffer)
-                                    results_buffer = []
-
-                    except Exception as e:
-                        print(f"Error in worker {worker_id}: {e}")
-                        # Mark worker as completed to avoid hanging
-                        worker_completed[worker_id] = True
-                
-                # Write any remaining results
-                if results_buffer:
-                    for output_line in results_buffer:
-                        outfile.write(output_line + "\n")
-                    outfile.flush()
-                    results_written += len(results_buffer)
-
-                # Wait for progress monitoring to complete
-                monitor_thread.join()
-
-        progress_bar.close()
-
-    else:
-        # Sequential processing (original logic)
-        if show_progress and HAS_TQDM and not parallel:
-            progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
         else:
-            progress_bar = None
+            # Sequential processing (original logic)
+            if show_progress and HAS_TQDM and not parallel:
+                progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
+            else:
+                progress_bar = None
 
-        processed_count = 0
+            processed_count = 0
 
-        start_dir = directory if directory else "."
-        for subdir, dirs, files in os.walk(start_dir):
-            if not files:
-                continue
-            if subdir == ".uma":
-                continue
-            if ".uma" in dirs:
-                dirs.remove(".uma")
-
-            for filename in files:
-                if subdir == "." and (filename == hash_file or filename == new_hash_file):
+            start_dir = directory if directory else "."
+            for subdir, dirs, files in os.walk(start_dir):
+                if not files:
                     continue
-                full_filename = os.path.join(subdir, filename)
-
-                if os.path.islink(full_filename):
+                if subdir == ".uma":
                     continue
+                if ".uma" in dirs:
+                    dirs.remove(".uma")
 
-                file_stat = os.stat(full_filename)
-                file_size = file_stat.st_size
-                file_inode = file_stat.st_ino
-                file_mtime = file_stat.st_mtime
+                for filename in files:
+                    if subdir == "." and (filename == hash_file or filename == file_writer.new_hash_file):
+                        continue
+                    full_filename = os.path.join(subdir, filename)
 
-                key = f"{full_filename}{file_size}{file_mtime}"
-                hashkey = _get_hash(key, algorithm)
-                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                    if os.path.islink(full_filename):
+                        continue
 
-                if hashkey in cache:
-                    if update:
-                        cache_data = cache.pop(hashkey)
-                        # Check if we can skip this file based on size and timestamp
-                        if _can_skip_file(full_filename, cache_data, verbose, file_stat=file_stat):
-                            # File is unchanged, just write the cached entry
+                    file_stat = os.stat(full_filename)
+                    file_size = file_stat.st_size
+                    file_inode = file_stat.st_ino
+                    file_mtime = file_stat.st_mtime
+
+                    key = f"{full_filename}{file_size}{file_mtime}"
+                    hashkey = _get_hash(key, algorithm)
+                    filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                    subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+
+                    if hashkey in cache:
+                        if update:
+                            cache_data = cache.pop(hashkey)
+                            # Check if we can skip this file based on size and timestamp
+                            if _can_skip_file(full_filename, cache_data, verbose, file_stat=file_stat):
+                                # File is unchanged, just write the cached entry
+                                if len(cache_data) == 5:
+                                    output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
+                                else:
+                                    output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
+                                file_writer.outfile.write(output + "\n")
+                            else:
+                                # File has changed, recalculate hash
+                                try:
+                                    with open(full_filename, "rb") as f:
+                                        hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+                                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                                    file_writer.outfile.write(output + "\n")
+                                except Exception as e:
+                                    print(f"Error processing {full_filename}: {e}")
+                                    if progress_bar:
+                                        progress_bar.update(1)
+                                    continue
+                        else:
+                            # Not update mode, just write cached entry
                             if len(cache_data) == 5:
                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
                             else:
                                 output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                            outfile.write(output + "\n")
-                        else:
-                            # File has changed, recalculate hash
-                            try:
-                                with open(full_filename, "rb") as f:
-                                    hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
-                                output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                                outfile.write(output + "\n")
-                            except Exception as e:
-                                print(f"Error processing {full_filename}: {e}")
-                                if progress_bar:
-                                    progress_bar.update(1)
-                                continue
+                            file_writer.outfile.write(output + "\n")
                     else:
-                        # Not update mode, just write cached entry
-                        if len(cache_data) == 5:
-                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|0"
-                        else:
-                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}|{cache_data[5]}"
-                        outfile.write(output + "\n")
-                else:
-                    try:
-                        with open(full_filename, "rb") as f:
-                            hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
-                    except Exception as e:
-                        print(f"Error processing {full_filename}: {e}")
-                        if progress_bar:
-                            progress_bar.update(1)
-                        continue
+                        try:
+                            with open(full_filename, "rb") as f:
+                                hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
+                        except Exception as e:
+                            print(f"Error processing {full_filename}: {e}")
+                            if progress_bar:
+                                progress_bar.update(1)
+                            continue
 
-                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
-                    outfile.write(output + "\n")
+                        output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                        file_writer.outfile.write(output + "\n")
 
-                processed_count += 1
-                if progress_bar:
-                    progress_bar.update(1)
+                    processed_count += 1
+                    if progress_bar:
+                        progress_bar.update(1)
 
-        if progress_bar:
-            progress_bar.close()
-
-    outfile.close()
-    if update:
-        os.rename(new_hash_file, hash_file)
-        if cache:
-            print(f"{len(cache)} old cache entries cleaned.")
-            for key in cache:
-                cache_data = cache[key]
-                print(f"{key} -> {cache_data[1]}/{cache_data[2]}")
+            if progress_bar:
+                progress_bar.close()
 
 
 def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
@@ -1044,3 +1012,77 @@ def _asserted_open(filename: str, mode: str) -> Any:
     except Exception as e:
         print(f"Error: {e}")
         raise e
+
+
+class HashFileWriter:
+    """Context manager for writing hash files with proper cleanup."""
+    
+    def __init__(self, hash_file: str, update: bool, append: bool, algorithm: str):
+        self.hash_file = hash_file
+        self.update = update
+        self.append = append
+        self.algorithm = algorithm
+        self.outfile = None
+        self.new_hash_file = None
+        self.results_written = 0
+        
+    def __enter__(self):
+        self.new_hash_file = self.hash_file + ".new"
+        
+        if self.update:
+            # Create a new file with algorithm header and only needed hashes
+            self.outfile = _asserted_open(self.new_hash_file, "w")
+            self.outfile.write(f"# Algorithm: {self.algorithm}\n")
+        else:
+            if self.append:
+                # Only appends new hashes
+                self.outfile = _asserted_open(self.hash_file, "a")
+            else:
+                # Create a new file with algorithm header
+                self.outfile = _asserted_open(self.hash_file, "w")
+                self.outfile.write(f"# Algorithm: {self.algorithm}\n")
+        
+        # Register cleanup function
+        atexit.register(self._cleanup)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._cleanup()
+    
+    def _signal_handler(self, signum, frame):
+        """Handle interruption signals."""
+        print(f"\n⚠️  Process interrupted (signal {signum}). Saving progress...")
+        self._cleanup()
+        sys.exit(1)
+    
+    def _cleanup(self):
+        """Clean up file handles and rename if needed."""
+        if self.outfile:
+            try:
+                self.outfile.flush()
+                self.outfile.close()
+                if self.update and self.new_hash_file and os.path.exists(self.new_hash_file):
+                    # Only rename if we have some content (more than just the header)
+                    if os.path.getsize(self.new_hash_file) > len(f"# Algorithm: {self.algorithm}\n"):
+                        os.rename(self.new_hash_file, self.hash_file)
+                        print(f"✅ Progress saved to {self.hash_file}")
+                    else:
+                        os.remove(self.new_hash_file)
+                        print("⚠️  No progress to save (only header written)")
+            except Exception as e:
+                print(f"⚠️  Error during cleanup: {e}")
+            finally:
+                self.outfile = None
+    
+    def write_results(self, results_buffer: List[str]) -> None:
+        """Write buffered results to file."""
+        if not self.outfile:
+            return
+            
+        for output_line in results_buffer:
+            self.outfile.write(output_line + "\n")
+        self.outfile.flush()  # Ensure data is written to disk
+        self.results_written += len(results_buffer)
