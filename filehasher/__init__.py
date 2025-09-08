@@ -66,9 +66,6 @@ def _calculate_hash(filepath: str, algorithm: str, verbose: bool = False) -> str
                 if not chunk:
                     break
                 hasher.update(chunk)
-                # Add small artificial delay to make progress more visible
-                import time
-                time.sleep(0.001)
     except OSError as e:
         if verbose:
             print(f"Error reading {filepath}: {e}")
@@ -167,58 +164,76 @@ def _can_skip_file(hashkey: str, file_size: int, file_inode: int, file_mtime: fl
             cached_inode == file_inode and 
             cached_mtime == file_mtime)
 
-def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue, cache: Dict, writer_queue=None) -> List[Tuple]:
+def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue, cache: Dict, writer_queue=None, debug: bool = False) -> List[Tuple]:
     """Process a batch of files in a worker process."""
+    if debug:
+        print(f"DEBUG: Worker {worker_id} started with {len(worker_files)} files")
     results = []
 
     for filepath in worker_files:
         try:
+            if debug:
+                print(f"DEBUG: Worker {worker_id} processing file: {filepath}")
+
             # Get file metadata
             file_stat = os.stat(filepath)
             file_size = file_stat.st_size
             file_inode = file_stat.st_ino
             file_mtime = file_stat.st_mtime
-            
+
             # Create hash key
             hashkey = _create_hash_key(filepath)
-            
+
+            if debug:
+                print(f"DEBUG: Worker {worker_id} created hashkey: {hashkey}")
+
             # Check if we can skip this file
-            if _can_skip_file(hashkey, file_size, file_inode, file_mtime, cache, file_stat):
+            can_skip = _can_skip_file(hashkey, file_size, file_inode, file_mtime, cache, file_stat)
+            if debug:
+                print(f"DEBUG: Worker {worker_id} can_skip: {can_skip}")
+
+            if can_skip:
                 if verbose:
                     progress_queue.put(('verbose', f"Skipped {os.path.basename(filepath)}"))
-            continue
+                continue
 
             # Send start processing message
             progress_queue.put(('start_processing', os.path.basename(filepath)))
-            
+
             # Calculate hash
             hexdigest = _calculate_hash(filepath, algorithm, verbose)
-            
+            if debug:
+                print(f"DEBUG: Worker {worker_id} calculated hash: {hexdigest[:16]}...")
+
             # Send processing message
             progress_queue.put(('processing', os.path.basename(filepath)))
-            
+
             # Get relative paths
             subdir = os.path.dirname(filepath)
             filename = os.path.basename(filepath)
-            
+
             # Send progress message
             progress_queue.put(('progress', os.path.basename(filepath)))
-            
+
             # Send result directly to writer queue if available
             if writer_queue is not None:
                 filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
                 subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
                 output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                if debug:
+                    print(f"DEBUG: Worker {worker_id} sending to writer queue: {output[:50]}...")
                 try:
                     writer_queue.put(output)
+                    if debug:
+                        print(f"DEBUG: Worker {worker_id} successfully sent result to writer queue")
                 except Exception as e:
                     if verbose:
                         progress_queue.put(('verbose', f"Error sending to writer queue: {e}"))
-            
+
             # Return result for backward compatibility
             result = (hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, filepath)
             results.append(result)
-            
+
         except Exception as e:
             if verbose:
                 progress_queue.put(('verbose', f"Error processing {filepath}: {e}"))
@@ -334,7 +349,7 @@ class WriterThread:
                 result_data = self._writer_queue.get(timeout=0.1)
                 if result_data is None:  # Sentinel value to stop
                     break
-                    
+
                 # Write the result to file
                 if not self.outfile or self._cleanup_done:
                     continue
@@ -342,13 +357,13 @@ class WriterThread:
                 try:
                     self.outfile.write(result_data + "\n")
                     self.results_written += 1
-                    
+
                     # Flush periodically
                     if self.results_written % self.write_frequency == 0:
                         self.outfile.flush()
                 except Exception as e:
                     print(f"⚠️  Error writing result: {e}")
-                    
+
                 self._writer_queue.task_done()
             except queue.Empty:
                 # No results available, continue
@@ -364,10 +379,10 @@ class WriterThread:
 
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                    algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True,
-                   workers: Optional[int] = None, verbose: bool = False, 
+                   workers: Optional[int] = None, verbose: bool = False, debug: bool = False,
                    directory: Optional[str] = None, write_frequency: int = 100) -> None:
     """Generate hash file for all files in specified directory tree.
-    
+
     Args:
         hash_file: Path to the hash file to create/update
         update: Whether to update existing hash file
@@ -376,6 +391,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         show_progress: Whether to show progress bars
         workers: Number of parallel workers (default: CPU count)
         verbose: Whether to show verbose output
+        debug: Whether to show debug output for troubleshooting
         directory: Directory to process (default: current directory)
         write_frequency: Write to file every N entries (default: 100)
     """
@@ -406,6 +422,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
     # Count total files first for progress tracking (much faster than collecting all)
     total_files = _collect_files(hash_file, collect_paths=False, directory=directory)
+    if debug:
+        print(f"DEBUG: Found {total_files} total files to process")
 
     # Determine number of workers (always use parallel, default to 1 worker if not specified)
     if workers is None:
@@ -466,7 +484,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     future_to_worker = {}
                     for worker_id, worker_files in enumerate(worker_file_lists):
                         if worker_files:  # Only create task if worker has files
-                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache, writer_queue)
+                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache, writer_queue, debug)
                             future_to_worker[future] = worker_id
 
                     # Function to monitor progress queues
@@ -581,7 +599,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     if worker_files:  # Only create task if worker has files
                         # Create dummy progress queue for workers
                         dummy_queue = manager.Queue()
-                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, dummy_queue, cache, writer_queue)
+                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, dummy_queue, cache, writer_queue, debug)
                         future_to_worker[future] = worker_id
 
                 # Wait for all workers to complete

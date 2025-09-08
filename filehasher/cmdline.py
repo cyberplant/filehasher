@@ -84,6 +84,10 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
                         dest="verbose",
                         help="Show detailed progress including filenames being processed")
 
+    parser.add_argument('--debug', action='store_true',
+                        dest="debug",
+                        help="Show debug output for troubleshooting")
+
     parser.add_argument('--directory', '-d', dest="directory",
                         help="Directory to process (default: current directory)")
 
@@ -148,6 +152,7 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             show_progress=show_progress,
             workers=args.workers,
             verbose=args.verbose,
+            debug=args.debug,
             directory=args.directory,
             write_frequency=args.write_frequency
         )
@@ -160,6 +165,7 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             show_progress=show_progress,
             workers=args.workers,
             verbose=args.verbose,
+            debug=args.debug,
             directory=args.directory,
             write_frequency=args.write_frequency
         )
@@ -172,6 +178,7 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             show_progress=show_progress,
             workers=args.workers,
             verbose=args.verbose,
+            debug=args.debug,
             directory=args.directory,
             write_frequency=args.write_frequency
         )
