@@ -427,7 +427,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             TextColumn("({task.completed}/{task.total})"),
             TextColumn("[dim]{task.fields[filename]}"),
             console=console,
-            refresh_per_second=30,  # Increased refresh rate for more responsive progress bars
+            refresh_per_second=100,  # Much higher refresh rate for real-time updates
+            auto_refresh=True,
         ) as progress:
             # Create progress tasks for each worker with correct totals
             worker_tasks = []
@@ -489,7 +490,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 # Process messages from ALL workers (not just active ones)
                                 for worker_id in range(workers):
                                     try:
-                                        message = progress_queues[worker_id].get_nowait()
+                                        # Use blocking get with timeout for more responsive progress updates
+                                        message = progress_queues[worker_id].get(timeout=0.001)
                                         if message[0] == 'start_processing':
                                             # Worker started processing a file
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
@@ -499,8 +501,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                         elif message[0] == 'progress':
                                             # Worker completed a file
                                             progress.update(worker_tasks[worker_id], advance=1)
-                                            # Force refresh of progress bars
-                                            progress.refresh()
+                                            # Force console update every 100 files for more responsive display
+                                            current_completed = progress.tasks[worker_tasks[worker_id]].completed
+                                            if current_completed % 100 == 0:
+                                                console.print(f"\r", end="")
                                         elif message[0] == 'verbose':
                                             # Verbose message from worker - show in progress bar description
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}: {message[1]}")
@@ -512,7 +516,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                 
                                 # Small delay to prevent busy waiting
                                 import time
-                                time.sleep(0.001)  # Reduced delay for more responsive progress bars
+                                time.sleep(0)
                         except Exception as e:
                             # Ignore errors during cleanup
                             pass
