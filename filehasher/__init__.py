@@ -23,7 +23,7 @@ except ImportError:
 
 # Constants
 DEFAULT_ALGORITHM = "md5"
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB
 CONFIG_FILE = os.path.expanduser("~/.filehasher")
 
 # Supported algorithms
@@ -74,7 +74,7 @@ def _calculate_hash(filepath: str, algorithm: str, verbose: bool = False) -> str
     
     return hasher.hexdigest()
 
-def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False, directory: Optional[str] = None) -> Union[int, List[Tuple[str, int]]]:
+def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False, directory: Optional[str] = None, verbose: bool = False) -> Union[int, List[Tuple[str, int]]]:
     """Collect files to process. Returns count or list of (path, size) tuples."""
     files = []
     start_dir = directory if directory else "."
@@ -99,8 +99,12 @@ def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: b
             try:
                 file_size = os.path.getsize(filepath)
                 if file_size > MAX_FILE_SIZE:
+                    if verbose:
+                        print(f"Skipping large file: {filepath} ({file_size/1024/1024:.1f}MB)")
                     continue
-            except OSError:
+            except OSError as e:
+                if verbose:
+                    print(f"Skipping inaccessible file: {filepath} ({e})")
                 continue
             
             if collect_paths:
@@ -451,7 +455,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 # Process files on-the-fly with parallel workers using shared list
                 with ProcessPoolExecutor(max_workers=workers) as executor:
                     # Collect all files with sizes for balanced distribution
-                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
+                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory, verbose=verbose)
 
                     # Distribute files among workers based on size for balanced workload
                     worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
@@ -546,7 +550,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
             # Process files with parallel workers
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 # Collect all files with sizes for balanced distribution
-                all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory)
+                all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory, verbose=verbose)
                 
                 # Distribute files among workers based on size for balanced workload
                 worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
