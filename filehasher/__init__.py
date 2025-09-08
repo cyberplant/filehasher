@@ -141,7 +141,12 @@ def _distribute_files_by_size(files_with_sizes: List[Tuple[str, int]], workers: 
         for i, (files, size) in enumerate(zip(worker_lists, worker_sizes)):
             percentage = (size / total_size * 100) if total_size > 0 else 0
             print(f"  Worker {i+1}: {len(files)} files, {size/1024/1024:.1f}MB ({percentage:.1f}%)")
-    
+
+    # Randomize each worker's file list to better distribute load over time
+    import random
+    for i in range(workers):
+        random.shuffle(worker_lists[i])
+
     return worker_lists
 
 def _can_skip_file(hashkey: str, file_size: int, file_inode: int, file_mtime: float, cache: Dict, file_stat: Optional[Any] = None) -> bool:
