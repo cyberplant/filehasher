@@ -18,12 +18,12 @@ Examples:
   %(prog)s --benchmark
   %(prog)s --compare other.hashes
   %(prog)s --update --algorithm md5
-  %(prog)s --generate --parallel --workers 4
-  %(prog)s --generate --parallel --algorithm sha256
-  %(prog)s --generate --parallel --verbose
-  %(prog)s --generate --parallel --workers 2 --verbose
+  %(prog)s --generate --workers 4
+  %(prog)s --generate --algorithm sha256
+  %(prog)s --generate --verbose
+  %(prog)s --generate --workers 2 --verbose
   %(prog)s --generate --directory /path/to/files
-  %(prog)s --update --directory ~/Downloads --parallel
+  %(prog)s --update --directory ~/Downloads
   %(prog)s --generate --write-frequency 50
 
 Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
@@ -76,13 +76,9 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
                         help="Suppress progress output")
 
     # Parallel processing
-    parser.add_argument('--parallel', '-P', action='store_true',
-                        dest="parallel",
-                        help="Process files in parallel using multiple workers")
-
     parser.add_argument('--workers', type=int, default=None,
                         dest="workers",
-                        help="Number of parallel workers (default: CPU count)")
+                        help="Number of parallel workers (default: CPU count, always uses parallel processing)")
 
     parser.add_argument('--verbose', '-v', action='store_true',
                         dest="verbose",
@@ -114,11 +110,11 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
 
     # Use config defaults if not specified
     if not hasattr(args, 'algorithm') or args.algorithm == 'md5':
-        args.algorithm = config['default_algorithm']
+        args.algorithm = config.get('default_algorithm', 'md5')
     if not args.benchmark_iterations:
-        args.benchmark_iterations = config['benchmark_iterations']
+        args.benchmark_iterations = config.get('benchmark_iterations', 3)
     if not args.quiet:
-        args.quiet = config['quiet']
+        args.quiet = config.get('quiet', False)
 
     # Handle benchmarking first
     if args.benchmark:
@@ -150,7 +146,6 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             args.hashfile,
             algorithm=args.algorithm,
             show_progress=show_progress,
-            parallel=args.parallel,
             workers=args.workers,
             verbose=args.verbose,
             directory=args.directory,
@@ -163,7 +158,6 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             append=True,
             algorithm=args.algorithm,
             show_progress=show_progress,
-            parallel=args.parallel,
             workers=args.workers,
             verbose=args.verbose,
             directory=args.directory,
@@ -176,7 +170,6 @@ Supported algorithms: md5, sha1, sha256, sha512, blake2b, blake2s
             update=True,
             algorithm=args.algorithm,
             show_progress=show_progress,
-            parallel=args.parallel,
             workers=args.workers,
             verbose=args.verbose,
             directory=args.directory,
