@@ -542,40 +542,47 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
                         # Function to monitor progress queues
                         def monitor_progress():
-                            while not all(worker_completed):
-                                for worker_id in range(workers):
-                                    if worker_completed[worker_id]:
-                                        continue
-                                    try:
-                                        message = progress_queues[worker_id].get_nowait()
-                                        if message[0] == 'progress':
-                                            _, wid, advance, filename = message
-                                            progress.update(worker_tasks[wid], advance=advance,
-                                                          filename=os.path.basename(filename) if verbose and filename else "")
-                                        elif message[0] == 'start_processing':
-                                            _, wid, advance, filename = message
-                                            # Update the display to show the file that's about to be processed
-                                            progress.update(worker_tasks[wid], advance=advance,
-                                                          filename=f"Starting: {os.path.basename(filename)}" if verbose and filename else "")
-                                        elif message[0] == 'processing':
-                                            _, wid, advance, filename, bytes_read = message
-                                            # Show the file currently being processed with bytes read
-                                            if verbose and filename:
-                                                size_mb = bytes_read / (1024 * 1024)
+                            try:
+                                while not all(worker_completed):
+                                    for worker_id in range(workers):
+                                        if worker_completed[worker_id]:
+                                            continue
+                                        try:
+                                            message = progress_queues[worker_id].get_nowait()
+                                            if message[0] == 'progress':
+                                                _, wid, advance, filename = message
                                                 progress.update(worker_tasks[wid], advance=advance,
-                                                              filename=f"Processing: {os.path.basename(filename)} ({size_mb:.1f}MB)")
-                                        elif message[0] == 'verbose':
-                                            _, wid, advance, verbose_msg = message
-                                            # Show verbose messages in the progress bar
-                                            if verbose:
+                                                              filename=os.path.basename(filename) if verbose and filename else "")
+                                            elif message[0] == 'start_processing':
+                                                _, wid, advance, filename = message
+                                                # Update the display to show the file that's about to be processed
                                                 progress.update(worker_tasks[wid], advance=advance,
-                                                              filename=verbose_msg)
-                                        elif message[0] == 'done':
-                                            worker_completed[message[1]] = True
-                                    except queue.Empty:
-                                        # Queue is empty, continue monitoring
-                                        pass
-                                time.sleep(0)  # Yield control to avoid busy waiting
+                                                              filename=f"Starting: {os.path.basename(filename)}" if verbose and filename else "")
+                                            elif message[0] == 'processing':
+                                                _, wid, advance, filename, bytes_read = message
+                                                # Show the file currently being processed with bytes read
+                                                if verbose and filename:
+                                                    size_mb = bytes_read / (1024 * 1024)
+                                                    progress.update(worker_tasks[wid], advance=advance,
+                                                                  filename=f"Processing: {os.path.basename(filename)} ({size_mb:.1f}MB)")
+                                            elif message[0] == 'verbose':
+                                                _, wid, advance, verbose_msg = message
+                                                # Show verbose messages in the progress bar
+                                                if verbose:
+                                                    progress.update(worker_tasks[wid], advance=advance,
+                                                                  filename=verbose_msg)
+                                            elif message[0] == 'done':
+                                                worker_completed[message[1]] = True
+                                        except queue.Empty:
+                                            # Queue is empty, continue monitoring
+                                            pass
+                                        except Exception as e:
+                                            # Handle any other exceptions gracefully
+                                            pass
+                                    time.sleep(0)  # Yield control to avoid busy waiting
+                            except Exception as e:
+                                # Handle any exceptions in the monitoring loop gracefully
+                                pass
 
                         # Start progress monitoring thread
                         monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
@@ -658,36 +665,43 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
 
                     # Function to monitor progress queues
                     def monitor_progress():
-                        while not all(worker_completed):
-                            for worker_id in range(workers):
-                                if worker_completed[worker_id]:
-                                    continue
-                                try:
-                                    message = progress_queues[worker_id].get_nowait()
-                                    if message[0] == 'progress':
-                                        _, wid, advance, filename = message
-                                        if verbose and filename:
-                                            progress_bar.set_description(f"Worker {wid+1}: Completed {os.path.basename(filename)}")
-                                        progress_bar.update(advance)
-                                    elif message[0] == 'start_processing':
-                                        _, wid, advance, filename = message
-                                        if verbose and filename:
-                                            progress_bar.set_description(f"Worker {wid+1}: Starting {os.path.basename(filename)}")
-                                    elif message[0] == 'processing':
-                                        _, wid, advance, filename, bytes_read = message
-                                        if verbose and filename:
-                                            size_mb = bytes_read / (1024 * 1024)
-                                            progress_bar.set_description(f"Worker {wid+1}: Processing {os.path.basename(filename)} ({size_mb:.1f}MB)")
-                                    elif message[0] == 'verbose':
-                                        _, wid, advance, verbose_msg = message
-                                        if verbose:
-                                            progress_bar.set_description(f"Worker {wid+1}: {verbose_msg}")
-                                    elif message[0] == 'done':
-                                        worker_completed[message[1]] = True
-                                except queue.Empty:
-                                    # Queue is empty, continue monitoring
-                                    pass
-                            time.sleep(0)  # Yield control to avoid busy waiting
+                        try:
+                            while not all(worker_completed):
+                                for worker_id in range(workers):
+                                    if worker_completed[worker_id]:
+                                        continue
+                                    try:
+                                        message = progress_queues[worker_id].get_nowait()
+                                        if message[0] == 'progress':
+                                            _, wid, advance, filename = message
+                                            if verbose and filename:
+                                                progress_bar.set_description(f"Worker {wid+1}: Completed {os.path.basename(filename)}")
+                                            progress_bar.update(advance)
+                                        elif message[0] == 'start_processing':
+                                            _, wid, advance, filename = message
+                                            if verbose and filename:
+                                                progress_bar.set_description(f"Worker {wid+1}: Starting {os.path.basename(filename)}")
+                                        elif message[0] == 'processing':
+                                            _, wid, advance, filename, bytes_read = message
+                                            if verbose and filename:
+                                                size_mb = bytes_read / (1024 * 1024)
+                                                progress_bar.set_description(f"Worker {wid+1}: Processing {os.path.basename(filename)} ({size_mb:.1f}MB)")
+                                        elif message[0] == 'verbose':
+                                            _, wid, advance, verbose_msg = message
+                                            if verbose:
+                                                progress_bar.set_description(f"Worker {wid+1}: {verbose_msg}")
+                                        elif message[0] == 'done':
+                                            worker_completed[message[1]] = True
+                                    except queue.Empty:
+                                        # Queue is empty, continue monitoring
+                                        pass
+                                    except Exception as e:
+                                        # Handle any other exceptions gracefully
+                                        pass
+                                time.sleep(0)  # Yield control to avoid busy waiting
+                        except Exception as e:
+                            # Handle any exceptions in the monitoring loop gracefully
+                            pass
 
                     # Start progress monitoring thread
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
@@ -1025,6 +1039,7 @@ class HashFileWriter:
         self.outfile = None
         self.new_hash_file = None
         self.results_written = 0
+        self._cleanup_done = False
         
     def __enter__(self):
         self.new_hash_file = self.hash_file + ".new"
@@ -1055,31 +1070,41 @@ class HashFileWriter:
     def _signal_handler(self, signum, frame):
         """Handle interruption signals."""
         print(f"\n⚠️  Process interrupted (signal {signum}). Saving progress...")
+        # Don't call sys.exit() here as it can cause threading issues
+        # Just do cleanup and let the main process handle the exit
         self._cleanup()
-        sys.exit(1)
     
     def _cleanup(self):
         """Clean up file handles and rename if needed."""
-        if self.outfile:
-            try:
-                self.outfile.flush()
-                self.outfile.close()
-                if self.update and self.new_hash_file and os.path.exists(self.new_hash_file):
-                    # Only rename if we have some content (more than just the header)
-                    if os.path.getsize(self.new_hash_file) > len(f"# Algorithm: {self.algorithm}\n"):
-                        os.rename(self.new_hash_file, self.hash_file)
-                        print(f"✅ Progress saved to {self.hash_file}")
-                    else:
-                        os.remove(self.new_hash_file)
-                        print("⚠️  No progress to save (only header written)")
-            except Exception as e:
-                print(f"⚠️  Error during cleanup: {e}")
-            finally:
-                self.outfile = None
+        if self._cleanup_done or not self.outfile:
+            return
+            
+        self._cleanup_done = True
+        try:
+            self.outfile.flush()
+            self.outfile.close()
+            if self.update and self.new_hash_file and os.path.exists(self.new_hash_file):
+                # Only rename if we have some content (more than just the header)
+                if os.path.getsize(self.new_hash_file) > len(f"# Algorithm: {self.algorithm}\n"):
+                    os.rename(self.new_hash_file, self.hash_file)
+                    print(f"✅ Progress saved to {self.hash_file}")
+                else:
+                    os.remove(self.new_hash_file)
+                    print("⚠️  No progress to save (only header written)")
+            elif not self.update and not self.append:
+                # For generate mode, check if we have content beyond the header
+                if os.path.exists(self.hash_file) and os.path.getsize(self.hash_file) > len(f"# Algorithm: {self.algorithm}\n"):
+                    print(f"✅ Progress saved to {self.hash_file}")
+                else:
+                    print("⚠️  No progress to save (only header written)")
+        except Exception as e:
+            print(f"⚠️  Error during cleanup: {e}")
+        finally:
+            self.outfile = None
     
     def write_results(self, results_buffer: List[str]) -> None:
         """Write buffered results to file."""
-        if not self.outfile:
+        if not self.outfile or self._cleanup_done:
             return
             
         for output_line in results_buffer:
