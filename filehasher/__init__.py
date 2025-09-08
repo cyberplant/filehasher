@@ -518,13 +518,13 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                         try:
                             # Just wait for worker to complete - results are sent directly to writer queue
                             future.result()
+                            # Mark this specific worker as completed
+                            worker_completed[worker_id] = True
                             
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
-                    
-                    # Mark all workers as completed after all futures are done
-                    for worker_id in range(workers):
-                        worker_completed[worker_id] = True
+                            # Mark this specific worker as completed even if it errored
+                            worker_completed[worker_id] = True
 
                     # Wait for progress monitoring to complete
                     monitor_thread.join(timeout=1.0)
