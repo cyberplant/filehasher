@@ -21,6 +21,58 @@ try:
 except ImportError:
     HAS_RICH = False
 
+class LatestOnlyQueue:
+    """A multiprocessing-compatible queue that only keeps the most recent item, discarding older ones.
+
+    This helps reduce UI lag by ensuring only the latest state is processed,
+    rather than processing every intermediate update from workers.
+    """
+
+    def __init__(self, manager=None):
+        # Use multiprocessing manager for cross-process compatibility
+        if manager is None:
+            manager = mp.Manager()
+
+        self._lock = manager.Lock()
+        self._queue = manager.Queue(maxsize=1)  # Use a queue with maxsize 1 for "latest only" behavior
+
+    def put(self, item, block=True, timeout=None):
+        """Put an item in the queue, replacing any existing item."""
+        # With maxsize=1, putting a new item will automatically discard the old one
+        try:
+            self._queue.put(item, block=False)
+        except:
+            # If queue is full, empty it first, then put the new item
+            try:
+                self._queue.get_nowait()
+            except:
+                pass
+            self._queue.put(item, block=False)
+
+    def get(self, block=True, timeout=None):
+        """Get the latest item from the queue."""
+        if not block:
+            return self.get_nowait()
+
+        # Use the underlying multiprocessing queue
+        return self._queue.get(block=block, timeout=timeout)
+
+    def get_nowait(self):
+        """Get the latest item without blocking."""
+        return self._queue.get_nowait()
+
+    def empty(self):
+        """Check if the queue is empty."""
+        return self._queue.empty()
+
+    def qsize(self):
+        """Return the approximate size of the queue (0 or 1)."""
+        return self._queue.qsize()
+
+    def full(self):
+        """Queue is never full since it only keeps one item."""
+        return False
+
 # Constants
 DEFAULT_ALGORITHM = "md5"
 CONFIG_FILE = os.path.expanduser("~/.filehasher")
@@ -174,6 +226,7 @@ def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool,
     if debug:
         print(f"DEBUG: Worker {worker_id} started with {len(worker_files)} files")
     results = []
+    files_processed = 0
 
     for filepath in worker_files:
         try:
@@ -217,8 +270,11 @@ def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool,
             subdir = os.path.dirname(filepath)
             filename = os.path.basename(filepath)
 
-            # Send progress message
-            progress_queue.put(('progress', os.path.basename(filepath)))
+            # Increment processed count and send progress message with count
+            files_processed += 1
+            if debug:
+                print(f"DEBUG: Worker {worker_id} sending progress message: ('progress', '{os.path.basename(filepath)}', {files_processed})")
+            progress_queue.put(('progress', os.path.basename(filepath), files_processed))
 
             # Send result directly to writer queue if available
             if writer_queue is not None:
@@ -462,9 +518,9 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                 task = progress.add_task(f"Worker {i+1}", total=0, filename="")
                 worker_tasks.append(task)
 
-            # Create progress queues for real-time updates using Manager
+            # Create LatestOnlyQueues for direct inter-process and UI communication
             with mp.Manager() as manager:
-                progress_queues = [manager.Queue() for _ in range(workers)]
+                progress_queues = [LatestOnlyQueue(manager) for _ in range(workers)]
                 worker_completed = manager.list([False] * workers)
                 
                 # Create multiprocessing queue for direct worker-to-writer communication
@@ -506,9 +562,15 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                         try:
                                             while True:
                                                 message = progress_queues[worker_id].get_nowait()
-                                                if message[0] == 'progress':
-                                                    progress.update(worker_tasks[worker_id], advance=1)
-                                                    progress.refresh()
+                                                if message[0] == 'progress' and len(message) > 2:
+                                                    progress_count = message[2]
+                                                    # Get current progress to calculate how much to advance
+                                                    current_progress = progress.tasks[worker_tasks[worker_id]].completed
+                                                    advance_amount = progress_count - current_progress
+                                                    if advance_amount > 0:
+                                                        progress.update(worker_tasks[worker_id], advance=advance_amount, filename=message[1])
+                                                        progress.refresh()
+                                                        console.file.flush()
                                         except queue.Empty:
                                             break
                                         except Exception:
@@ -516,10 +578,16 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                     break
 
                                 # Process messages from ALL workers (not just active ones)
+                                last_progress_update = {}  # Track last update time per worker
                                 for worker_id in range(workers):
                                     try:
-                                        # Use blocking get with timeout
-                                        message = progress_queues[worker_id].get(timeout=0.001)
+                                        # Use blocking get with longer timeout for better responsiveness
+                                        if debug:
+                                            print(f"DEBUG: UI trying to get message from worker {worker_id}")
+                                        message = progress_queues[worker_id].get(timeout=0.01)
+                                        if debug:
+                                            print(f"DEBUG: Processing message from worker {worker_id}: {message}")
+
                                         if message[0] == 'start_processing':
                                             # Worker started processing a file
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
@@ -527,10 +595,34 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                             # Worker is processing a file
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
                                         elif message[0] == 'progress':
-                                            # Update progress immediately for better responsiveness
-                                            progress.update(worker_tasks[worker_id], advance=1, filename=message[1])
-                                            # Force refresh to ensure immediate display
-                                            progress.refresh()
+                                            if debug:
+                                                progress_count = message[2] if len(message) > 2 else 1
+                                                print(f"DEBUG: Progress update - worker {worker_id}, count: {progress_count}, file: {message[1]}")
+
+                                            # Handle progress updates with throttling
+                                            progress_count = message[2] if len(message) > 2 else 1
+                                            current_time = time.time()
+
+                                            # Throttle progress updates to at most once every 50ms per worker
+                                            if worker_id not in last_progress_update or (current_time - last_progress_update[worker_id]) >= 0.05:
+                                                last_progress_update[worker_id] = current_time
+
+                                                # Get current progress to calculate how much to advance
+                                                current_progress = progress.tasks[worker_tasks[worker_id]].completed
+                                                advance_amount = progress_count - current_progress
+
+                                                if advance_amount > 0:
+                                                    progress.update(worker_tasks[worker_id], advance=advance_amount, filename=message[1])
+                                                    # Force refresh for progress updates
+                                                    progress.refresh()
+                                                    # Force console flush to ensure immediate display
+                                                    console.file.flush()
+
+                                                    # Print simple progress to stdout for immediate visibility
+                                                    total = progress.tasks[worker_tasks[worker_id]].total
+                                                    current = progress.tasks[worker_tasks[worker_id]].completed
+                                                    if current > 0 and current < total:  # Only show intermediate progress
+                                                        print(f"\rWorker {worker_id+1}: {current}/{total} files processed", end="", flush=True)
                                         elif message[0] == 'verbose':
                                             # Verbose message from worker - show in progress bar description
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}: {message[1]}")
