@@ -266,15 +266,15 @@ class HashfileBrowser:
         """Render the current screen."""
         width, height = self.get_terminal_size()
         
-        # Clear screen
-        print("\033[2J\033[H", end="")
+        # Clear screen and position cursor at top
+        print("\033[2J\033[H", end="", flush=True)
         
-        # Header with sort mode indicator
-        path_str = self.current_dir.path or "/"
-        sort_indicator = "Size" if self.sort_by_size else "Name"
-        header = f" {path_str} - {self.format_size(self.current_dir.size)} ({self.current_dir.file_count} files) [Sort: {sort_indicator}]"
-        print(self.colorize_header(header[:width]))
-        print("-" * min(len(header), width))
+        # Header with breadcrumbs
+        breadcrumbs = self.create_breadcrumbs()
+        header = f"{Colors.BRIGHT_WHITE}{Colors.BOLD}📁 {breadcrumbs}{Colors.RESET}"
+
+        print(header[:width])
+        print("-" * min(width, 80))
 
         # Get items to display (now using the centralized method)
         items = self.get_current_items()
@@ -290,8 +290,8 @@ class HashfileBrowser:
                 if size > max_size:
                     max_size = size
         
-        # Calculate display area
-        display_height = height - 4  # Header + separator + footer
+        # Calculate display area with buffer for terminal quirks
+        display_height = height - 4  # Header + separator + footer + 1 buffer line
         
         # Adjust scroll if needed
         if self.selected_index < self.scroll_offset:
@@ -389,12 +389,21 @@ class HashfileBrowser:
                         ansi_chars += 1
             print(line)
         
-        # Footer
-        print("-" * min(60, width))
+        # Ultra-compact footer to prevent wrapping
+        size_info = f"{Colors.BRIGHT_CYAN}{self.format_size(self.current_dir.size)} ({self.current_dir.file_count}){Colors.RESET}"
+        sort_indicator = "Size" if self.sort_by_size else "Name"
+
+        navigation = f"{Colors.BRIGHT_YELLOW}↑↓←→/hjkl{Colors.RESET}"
+        actions = f"{Colors.BRIGHT_BLUE}Enter{Colors.RESET}"
+
         sort_mode = "Size" if self.sort_by_size else "Name"
         bars_status = "ON" if self.show_size_bars else "OFF"
-        footer = f"Use arrows/hjkl/Ctrl+B/F/Space/b to navigate, Enter/l to select, s=sort({sort_mode}), g=bars({bars_status}), q=quit"
-        print(self.colorize_footer(footer))
+
+        controls = f"{Colors.BRIGHT_RED}s{Colors.RESET}={sort_mode[:1].lower()}, {Colors.BRIGHT_RED}g{Colors.RESET}={bars_status.lower()}, {Colors.BRIGHT_RED}q{Colors.RESET}=quit"
+
+        # Very compact single line
+        footer = f"{size_info} [{sort_indicator[:1]}] | {navigation}/{actions} | {controls}"
+        print(footer)
     
     def get_key(self) -> str:
         """Get a single keypress."""
@@ -504,6 +513,40 @@ class HashfileBrowser:
     def colorize_size(self, size_str: str) -> str:
         """Colorize file size text."""
         return f"{Colors.BRIGHT_CYAN}{size_str}{Colors.RESET}"
+
+    def create_breadcrumbs(self) -> str:
+        """Create breadcrumb trail showing path hierarchy."""
+        if not self.current_dir:
+            return "/"
+
+        # Build path components
+        components = []
+        current = self.current_dir
+
+        # Walk up the tree to build the full path
+        while current:
+            if current.name and current.name != "(Hash File Root)":  # Skip technical names
+                components.insert(0, current.name)
+            elif not current.parent:  # This is the root
+                components.insert(0, "/")
+            current = current.parent
+
+        # Remove any empty components and clean up
+        components = [comp for comp in components if comp]
+
+        # If we have no components, we're at root
+        if not components:
+            return "/"
+
+        # Create breadcrumb string with proper colors
+        breadcrumb_parts = []
+        for i, component in enumerate(components):
+            if i == len(components) - 1:  # Last component (current directory)
+                breadcrumb_parts.append(f"{Colors.BRIGHT_WHITE}{Colors.BOLD}{component}{Colors.RESET}")
+            else:  # Parent directories
+                breadcrumb_parts.append(f"{Colors.CYAN}{component}{Colors.RESET}")
+
+        return "/".join(breadcrumb_parts)
 
     def colorize_header(self, header: str) -> str:
         """Colorize header text."""
@@ -679,7 +722,7 @@ class HashfileBrowser:
                         self.current_dir = self.current_dir.parent
                         self.selected_index = 0
                         self.scroll_offset = 0
-                elif key in ['\033[C', 'l']:  # Right arrow or vim l (enter directory)
+                elif key in ['\033[C', 'l', '\r', '\n']:  # Right arrow, vim l, or Enter (enter directory)
                     self.enter_selected()
                 # Page navigation - multiple sequences for cross-platform compatibility
                 elif key in ['\033[5~', '\033[[5~', '\002', '\x02']:  # Page Up (Ctrl+B)
@@ -698,8 +741,6 @@ class HashfileBrowser:
                     self.scroll_offset = 0
                 elif key == 'g':  # Toggle size bars
                     self.show_size_bars = not self.show_size_bars
-                elif key == '\r' or key == '\n':  # Enter
-                    self.enter_selected()
                     
         except KeyboardInterrupt:
             pass
