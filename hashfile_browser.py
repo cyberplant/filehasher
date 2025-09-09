@@ -7,6 +7,8 @@ import os
 import sys
 import termios
 import tty
+import signal
+import select
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
@@ -108,6 +110,9 @@ class HashfileBrowser:
         self.show_size_bars = True  # Show/hide size bars
         # Tagging system
         self.tagged_items = set()  # Set of tagged FileEntry and DirEntry objects
+        # Terminal size tracking for auto-refresh
+        self.prev_terminal_size = None
+        self.resize_pending = False
         
     def load_hashfile(self, filepath: str) -> bool:
         """Load and parse a .hashes file."""
@@ -276,8 +281,9 @@ class HashfileBrowser:
     def get_terminal_size(self) -> Tuple[int, int]:
         """Get terminal dimensions."""
         try:
-            return os.get_terminal_size()
-        except:
+            size = os.get_terminal_size()
+            return (size.columns, size.lines)
+        except (OSError, AttributeError):
             return (80, 24)  # Default fallback
     
     def render_screen(self) -> None:
@@ -365,7 +371,7 @@ class HashfileBrowser:
                 # Include size bar with color
                 size_bar = self.create_size_bar(size, max_size, bar_width=10)
                 ratio = size / max_size if max_size > 0 else 0
-                colored_bar = self.colorize_size_bar(size_bar, ratio)
+                colored_bar = self.colorize_size_bar(size_bar, ratio, is_selected)
 
                 # Use calculated layout positions
                 name_width = layout['name_width']
@@ -398,7 +404,7 @@ class HashfileBrowser:
                 if self.show_size_bars and max_size > 0:
                     size_bar = self.create_size_bar(size, max_size, bar_width=10)
                     ratio = size / max_size if max_size > 0 else 0
-                    colored_bar = self.colorize_size_bar(size_bar, ratio)
+                    colored_bar = self.colorize_size_bar(size_bar, ratio, is_selected)
 
                     line_parts = [marker, " ", colored_name]
                     current_pos = 2 + self.get_visual_length(colored_name)
@@ -458,11 +464,25 @@ class HashfileBrowser:
         print(footer)
     
     def get_key(self) -> str:
-        """Get a single keypress."""
+        """Get a single keypress with timeout to allow resize detection."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setraw(sys.stdin.fileno())
+
+            # Use select to wait for input with a timeout to allow periodic resize checks
+            while True:
+                # Check for resize events
+                if self.resize_pending:
+                    # Return a special resize key that will trigger a refresh
+                    self.resize_pending = False
+                    return '\033[resize]'  # Special key to indicate resize
+
+                # Wait for input with a short timeout (0.1 seconds)
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    break
+
             key = sys.stdin.read(1)
 
             # Handle escape sequences
@@ -535,18 +555,32 @@ class HashfileBrowser:
 
         return f"[{bar}]"
 
-    def get_size_bar_color(self, ratio: float) -> str:
+    def get_size_bar_color(self, ratio: float, is_selected: bool = False) -> str:
         """Get color for size bar based on size ratio."""
-        if ratio >= 0.8:
-            return Colors.BRIGHT_RED
-        elif ratio >= 0.6:
-            return Colors.BRIGHT_YELLOW
-        elif ratio >= 0.4:
-            return Colors.BRIGHT_GREEN
-        elif ratio >= 0.2:
-            return Colors.BRIGHT_BLUE
+        if is_selected:
+            # Use colors that work well on reverse video (both light and dark terminals)
+            if ratio >= 0.8:
+                return Colors.BRIGHT_RED  # Bright red for full bars - visible on both light/dark
+            elif ratio >= 0.6:
+                return Colors.BRIGHT_YELLOW  # Bright yellow for good contrast
+            elif ratio >= 0.4:
+                return Colors.BRIGHT_GREEN  # Bright green for medium contrast
+            elif ratio >= 0.2:
+                return Colors.BRIGHT_BLUE  # Bright blue for visibility
+            else:
+                return Colors.BRIGHT_BLACK  # Dark gray for empty bars
         else:
-            return Colors.BRIGHT_BLACK
+            # Normal colors for unselected items
+            if ratio >= 0.8:
+                return Colors.BRIGHT_RED
+            elif ratio >= 0.6:
+                return Colors.BRIGHT_YELLOW
+            elif ratio >= 0.4:
+                return Colors.BRIGHT_GREEN
+            elif ratio >= 0.2:
+                return Colors.BRIGHT_BLUE
+            else:
+                return Colors.BRIGHT_BLACK
 
     def colorize_item(self, name: str, is_dir: bool, is_selected: bool, obj: Optional[object] = None) -> str:
         """Colorize item name based on type, selection status, and tagging."""
@@ -569,10 +603,14 @@ class HashfileBrowser:
         else:
             return f"{Colors.WHITE}{name}{Colors.RESET}"
 
-    def colorize_size_bar(self, bar: str, ratio: float) -> str:
+    def colorize_size_bar(self, bar: str, ratio: float, is_selected: bool = False) -> str:
         """Colorize size bar with gradient based on size ratio."""
-        color = self.get_size_bar_color(ratio)
-        return f"{color}{bar}{Colors.RESET}"
+        color = self.get_size_bar_color(ratio, is_selected)
+        # Don't add RESET when selected, as it will interfere with reverse video
+        if is_selected:
+            return f"{color}{bar}"
+        else:
+            return f"{color}{bar}{Colors.RESET}"
 
     def colorize_size(self, size_str: str) -> str:
         """Colorize file size text."""
@@ -867,21 +905,52 @@ class HashfileBrowser:
     def clear_all_taggings(self) -> None:
         """Clear all tagged items."""
         self.tagged_items.clear()
-    
+
+    def handle_resize(self, signum, frame):
+        """Handle terminal resize signal."""
+        self.resize_pending = True
+
     def run(self) -> None:
         """Main application loop."""
         if not self.root_dir:
             print("No hashfile loaded!")
             return
-        
+
+        # Set up signal handler for terminal resize (SIGWINCH)
+        try:
+            signal.signal(signal.SIGWINCH, self.handle_resize)
+        except (OSError, ValueError):
+            # Signal handling not available on this platform
+            pass
+
         try:
             while True:
-                self.render_screen()
+                # Check for terminal size changes and refresh if needed
+                current_size = self.get_terminal_size()
+
+                # Check if resize was detected via signal or size difference
+                size_changed = (self.prev_terminal_size is None or
+                               self.prev_terminal_size != current_size or
+                               self.resize_pending)
+
+                if size_changed:
+                    # Size changed - update and force re-render
+                    self.prev_terminal_size = current_size
+                    self.resize_pending = False
+                    # Clear screen completely and re-render
+                    print("\033[2J\033[H", end="", flush=True)
+                    self.render_screen()
+                else:
+                    # Normal render
+                    self.render_screen()
 
                 key = self.get_key()
 
                 if key == 'q':
                     break
+                elif key == '\033[resize]':
+                    # Handle resize event - just continue to re-render
+                    continue
                 # Arrow keys and vim navigation
                 elif key in ['\033[A', 'k']:  # Up arrow or vim k
                     self.navigate(-1)
