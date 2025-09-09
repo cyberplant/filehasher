@@ -410,16 +410,16 @@ class HashfileBrowser:
                 else:
                     line = f"{marker} {colored_name:<{name_width}} {colored_size:>10}"
 
-            # Apply full-line highlighting for selected items
+            # Handle line formatting based on selection status
             if is_selected:
-                # Pad the line to full terminal width and apply reverse video to entire line
+                # For selected items: apply full-line reverse video highlighting
                 visual_line = self.strip_ansi_codes(line)
                 padding_needed = width - len(visual_line)
                 if padding_needed > 0:
                     line += " " * padding_needed
                 line = f"{Colors.REVERSE}{line}{Colors.RESET}"
             else:
-                # Truncate to terminal width for non-selected items (but account for ANSI codes in truncation)
+                # For non-selected items: truncate to terminal width if needed
                 visual_line = self.strip_ansi_codes(line)
                 if len(visual_line) > width:
                     # Need to truncate while preserving ANSI codes
@@ -445,13 +445,13 @@ class HashfileBrowser:
 
         sort_indicator = "Size" if self.sort_by_size else "Name"
 
-        navigation = f"{Colors.BRIGHT_YELLOW}↑↓←→/hjkl{Colors.RESET}"
+        navigation = f"{Colors.BRIGHT_YELLOW}↑↓←→/hjkl/Home/End{Colors.RESET}"
         actions = f"{Colors.BRIGHT_BLUE}Enter{Colors.RESET}"
 
         sort_mode = "Size" if self.sort_by_size else "Name"
         bars_status = "ON" if self.show_size_bars else "OFF"
 
-        controls = f"{Colors.BRIGHT_RED}s{Colors.RESET}={sort_mode[:1].lower()}, {Colors.BRIGHT_RED}g{Colors.RESET}={bars_status.lower()}, {Colors.BRIGHT_RED}t{Colors.RESET}/Space=tag, {Colors.BRIGHT_RED}q{Colors.RESET}=quit"
+        controls = f"{Colors.BRIGHT_RED}s{Colors.RESET}={sort_mode[:1].lower()}, {Colors.BRIGHT_RED}g{Colors.RESET}={bars_status.lower()}, {Colors.BRIGHT_RED}t{Colors.RESET}/Space=tag, {Colors.BRIGHT_RED}c{Colors.RESET}=clear, {Colors.BRIGHT_RED}q{Colors.RESET}=quit"
 
         # Very compact single line
         footer = f"{size_info} [{sort_indicator[:1]}] | {navigation}/{actions} | {controls}"
@@ -555,9 +555,9 @@ class HashfileBrowser:
 
         if is_selected:
             if is_tagged:
-                return f"{Colors.BRIGHT_YELLOW}{name} ✓{Colors.RESET}"
+                return f"{Colors.BRIGHT_YELLOW}{name} ✓"
             else:
-                return f"{name}{Colors.RESET}"
+                return f"{name}"
         elif is_tagged:
             # Tagged items get special coloring and marking
             if is_dir:
@@ -844,10 +844,10 @@ class HashfileBrowser:
         else:
             self.tagged_items.add(obj)
 
-        # Auto-advance to next item for easier tagging workflow
+        # Auto-advance to next item for easier tagging workflow (don't wrap around)
         items_count = len(items)
-        if items_count > 0:
-            self.selected_index = (self.selected_index + 1) % items_count
+        if items_count > 0 and self.selected_index < items_count - 1:
+            self.selected_index += 1
 
     def get_tagged_stats(self) -> Tuple[int, int]:
         """Get total size and file count of tagged items."""
@@ -863,6 +863,10 @@ class HashfileBrowser:
                 total_files += 1
 
         return total_size, total_files
+
+    def clear_all_taggings(self) -> None:
+        """Clear all tagged items."""
+        self.tagged_items.clear()
     
     def run(self) -> None:
         """Main application loop."""
@@ -890,6 +894,21 @@ class HashfileBrowser:
                         self.scroll_offset = 0
                 elif key in ['\033[C', 'l', '\r', '\n']:  # Right arrow, vim l, or Enter (enter directory)
                     self.enter_selected()
+                # Home/End navigation
+                elif key in ['\033[H', '\033[1~']:  # Home key - go to first item
+                    self.selected_index = 0
+                    self.scroll_offset = 0
+                elif key in ['\033[F', '\033[4~']:  # End key - go to last item
+                    items_count = len(self.get_current_items())
+                    if items_count > 0:
+                        self.selected_index = items_count - 1
+                        # Adjust scroll offset to show the last item
+                        width, height = self.get_terminal_size()
+                        display_height = height - 4  # Header + separator + footer + 1 buffer line
+                        if self.selected_index >= display_height:
+                            self.scroll_offset = self.selected_index - display_height + 1
+                        else:
+                            self.scroll_offset = 0
                 # Page navigation - multiple sequences for cross-platform compatibility
                 elif key in ['\033[5~', '\033[[5~', '\002', '\x02']:  # Page Up (Ctrl+B)
                     self.navigate_page(-1)
@@ -901,6 +920,8 @@ class HashfileBrowser:
                 # Tagging
                 elif key in ['t', ' ']:  # 't' or Space - Toggle tag
                     self.toggle_tag_selected()
+                elif key == 'c':  # 'c' - Clear all taggings
+                    self.clear_all_taggings()
                 # Sorting and display options
                 elif key == 's':  # Toggle sorting mode
                     self.sort_by_size = not self.sort_by_size
