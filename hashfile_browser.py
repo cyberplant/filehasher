@@ -365,13 +365,13 @@ class HashfileBrowser:
 
             # Colorize the truncated name and size
             colored_name = self.colorize_item(truncated_name, is_dir, is_selected, obj)
-            colored_size = self.colorize_size(size_str)
+            colored_size = self.colorize_size(size_str, obj)
 
             if self.show_size_bars and max_size > 0:
                 # Include size bar with color
                 size_bar = self.create_size_bar(size, max_size, bar_width=10)
                 ratio = size / max_size if max_size > 0 else 0
-                colored_bar = self.colorize_size_bar(size_bar, ratio, is_selected)
+                colored_bar = self.colorize_size_bar(size_bar, ratio, obj)
 
                 # Use calculated layout positions
                 name_width = layout['name_width']
@@ -404,7 +404,7 @@ class HashfileBrowser:
                 if self.show_size_bars and max_size > 0:
                     size_bar = self.create_size_bar(size, max_size, bar_width=10)
                     ratio = size / max_size if max_size > 0 else 0
-                    colored_bar = self.colorize_size_bar(size_bar, ratio, is_selected)
+                    colored_bar = self.colorize_size_bar(size_bar, ratio, obj)
 
                     line_parts = [marker, " ", colored_name]
                     current_pos = 2 + self.get_visual_length(colored_name)
@@ -525,62 +525,40 @@ class HashfileBrowser:
         self.selected_index = max(0, min(self.selected_index, items_count - 1))
 
     def create_size_bar(self, size: int, max_size: int, bar_width: int = 10) -> str:
-        """Create a visual size bar like ncdu."""
+        """Create a visual size bar with Unicode characters."""
         if max_size == 0:
             return ""
 
         ratio = size / max_size
         filled = int(ratio * bar_width)
 
-        # Use different characters for different fill levels
-        if ratio >= 0.9:
-            bar_char = "█"
-        elif ratio >= 0.7:
-            bar_char = "▊"
-        elif ratio >= 0.5:
-            bar_char = "▌"
-        elif ratio >= 0.3:
-            bar_char = "▍"
-        elif ratio >= 0.1:
-            bar_char = "▎"
-        else:
-            bar_char = "▏"
+        # Use solid blocks for filled parts, light shade for empty parts
+        filled_char = "█"  # Solid block for filled parts
+        empty_char = "░"   # Light shade for empty parts
 
-        bar = bar_char * filled
+        bar = filled_char * filled
         remaining = bar_width - filled
 
-        # Add empty space for remaining width
+        # Add empty characters for remaining width
         if remaining > 0:
-            bar += " " * remaining
+            bar += empty_char * remaining
 
-        return f"[{bar}]"
+        # Return bar content without brackets - we'll add them in colorize_size_bar
+        return bar
 
     def get_size_bar_color(self, ratio: float, is_selected: bool = False) -> str:
-        """Get color for size bar based on size ratio."""
-        if is_selected:
-            # Use colors that work well on reverse video (both light and dark terminals)
-            if ratio >= 0.8:
-                return Colors.BRIGHT_RED  # Bright red for full bars - visible on both light/dark
-            elif ratio >= 0.6:
-                return Colors.BRIGHT_YELLOW  # Bright yellow for good contrast
-            elif ratio >= 0.4:
-                return Colors.BRIGHT_GREEN  # Bright green for medium contrast
-            elif ratio >= 0.2:
-                return Colors.BRIGHT_BLUE  # Bright blue for visibility
-            else:
-                return Colors.BRIGHT_BLACK  # Dark gray for empty bars
+        """Get color for size bar based on size ratio - consistent colors work with reverse video."""
+        # Use consistent, highly visible colors that work well on both normal and reverse backgrounds
+        if ratio >= 0.8:
+            return Colors.BRIGHT_RED     # Bright red for full bars
+        elif ratio >= 0.6:
+            return Colors.BRIGHT_YELLOW  # Bright yellow for high usage
+        elif ratio >= 0.4:
+            return Colors.BRIGHT_GREEN   # Bright green for medium usage
+        elif ratio >= 0.2:
+            return Colors.BRIGHT_CYAN    # Bright cyan for low usage
         else:
-            # Normal colors for unselected items
-            if ratio >= 0.8:
-                return Colors.BRIGHT_RED
-            elif ratio >= 0.6:
-                return Colors.BRIGHT_YELLOW
-            elif ratio >= 0.4:
-                return Colors.BRIGHT_GREEN
-            elif ratio >= 0.2:
-                return Colors.BRIGHT_BLUE
-            else:
-                return Colors.BRIGHT_BLACK
+            return Colors.BRIGHT_WHITE   # Bright white for empty bars (visible on any background)
 
     def colorize_item(self, name: str, is_dir: bool, is_selected: bool, obj: Optional[object] = None) -> str:
         """Colorize item name based on type, selection status, and tagging."""
@@ -603,18 +581,31 @@ class HashfileBrowser:
         else:
             return f"{Colors.WHITE}{name}{Colors.RESET}"
 
-    def colorize_size_bar(self, bar: str, ratio: float, is_selected: bool = False) -> str:
-        """Colorize size bar with gradient based on size ratio."""
-        color = self.get_size_bar_color(ratio, is_selected)
-        # Don't add RESET when selected, as it will interfere with reverse video
-        if is_selected:
-            return f"{color}{bar}"
-        else:
-            return f"{color}{bar}{Colors.RESET}"
+    def colorize_size_bar(self, bar: str, ratio: float, obj=None) -> str:
+        """Colorize size bar content with neutral brackets."""
+        if not bar:  # Empty bar
+            return "[]"
 
-    def colorize_size(self, size_str: str) -> str:
+        # Check if item is tagged
+        is_tagged = obj is not None and obj in self.tagged_items
+
+        if is_tagged:
+            # Use yellow for tagged items
+            color = Colors.BRIGHT_YELLOW
+        else:
+            color = self.get_size_bar_color(ratio)
+        # Use neutral color for brackets, colored content for the bar
+        return f"[{color}{bar}{Colors.RESET}]"
+
+    def colorize_size(self, size_str: str, obj=None) -> str:
         """Colorize file size text."""
-        return f"{Colors.BRIGHT_CYAN}{size_str}{Colors.RESET}"
+        # Check if item is tagged
+        is_tagged = obj is not None and obj in self.tagged_items
+
+        if is_tagged:
+            return f"{Colors.BRIGHT_YELLOW}{size_str}{Colors.RESET}"
+        else:
+            return f"{Colors.BRIGHT_CYAN}{size_str}{Colors.RESET}"
 
     def create_breadcrumbs(self) -> str:
         """Create breadcrumb trail showing path hierarchy."""
