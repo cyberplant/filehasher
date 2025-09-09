@@ -277,6 +277,16 @@ class HashfileBrowser:
             return f"{int(size_f)} {units[unit_idx]}"
         else:
             return f"{size_f:.1f} {units[unit_idx]}"
+
+    def format_size_with_count(self, size: int, obj=None) -> str:
+        """Format size with file count for directories."""
+        size_str = self.format_size(size)
+
+        # Add file count for directories
+        if obj and isinstance(obj, DirEntry):
+            return f"{size_str} ({obj.file_count})"
+        else:
+            return size_str
     
     def get_terminal_size(self) -> Tuple[int, int]:
         """Get terminal dimensions."""
@@ -349,7 +359,7 @@ class HashfileBrowser:
                 continue
 
             name, size, is_dir, obj = items[item_index]
-            size_str = self.format_size(size)
+            size_str = self.format_size_with_count(size, obj)
             is_selected = (item_index == self.selected_index)
 
             # Create line with proper spacing
@@ -369,7 +379,7 @@ class HashfileBrowser:
 
             if self.show_size_bars and max_size > 0:
                 # Include size bar with color
-                size_bar = self.create_size_bar(size, max_size, bar_width=10)
+                size_bar = self.create_size_bar(size, max_size, bar_width=8)
                 ratio = size / max_size if max_size > 0 else 0
                 colored_bar = self.colorize_size_bar(size_bar, ratio, obj)
 
@@ -402,7 +412,7 @@ class HashfileBrowser:
 
                 # Rebuild the line with the corrected name
                 if self.show_size_bars and max_size > 0:
-                    size_bar = self.create_size_bar(size, max_size, bar_width=10)
+                    size_bar = self.create_size_bar(size, max_size, bar_width=8)
                     ratio = size / max_size if max_size > 0 else 0
                     colored_bar = self.colorize_size_bar(size_bar, ratio, obj)
 
@@ -524,7 +534,7 @@ class HashfileBrowser:
 
         self.selected_index = max(0, min(self.selected_index, items_count - 1))
 
-    def create_size_bar(self, size: int, max_size: int, bar_width: int = 10) -> str:
+    def create_size_bar(self, size: int, max_size: int, bar_width: int = 8) -> str:
         """Create a visual size bar with Unicode characters."""
         if max_size == 0:
             return ""
@@ -768,8 +778,8 @@ class HashfileBrowser:
 
         # Calculate positions
         marker_space = 2  # ">" + space
-        bar_width = 12 if self.show_size_bars else 0  # "[██████████]" + space
-        size_width = 10  # Size string width
+        bar_width = 10 if self.show_size_bars else 0  # "[████████]" + space (reduced to make room)
+        size_width = 15  # Size string width (increased for file counts)
         min_name_width = 15  # Minimum readable filename width
 
         # Calculate available space for filename
