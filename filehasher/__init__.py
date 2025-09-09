@@ -6,336 +6,497 @@ import sys
 import time
 import queue
 import configparser
+import signal
+import atexit
+import threading
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
-
-try:
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
     from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
 
-BLOCKSIZE = 1024 * 1024
-SCRIPT_FILENAME = "filehasher_script.sh"
-repeated: Dict[str, List] = {}
+class LatestOnlyQueue:
+    """A multiprocessing-compatible queue that only keeps the most recent item, discarding older ones.
 
-# Supported hash algorithms
-SUPPORTED_ALGORITHMS = {
-    'md5': hashlib.md5,
-    'sha1': hashlib.sha1,
-    'sha256': hashlib.sha256,
-    'sha512': hashlib.sha512,
-    'blake2b': hashlib.blake2b,
-    'blake2s': hashlib.blake2s,
+    This helps reduce UI lag by ensuring only the latest state is processed,
+    rather than processing every intermediate update from workers.
+    """
+
+    def __init__(self, manager=None):
+        # Use multiprocessing manager for cross-process compatibility
+        if manager is None:
+            manager = mp.Manager()
+
+        self._lock = manager.Lock()
+        self._queue = manager.Queue(maxsize=1)  # Use a queue with maxsize 1 for "latest only" behavior
+
+    def put(self, item, block=True, timeout=None):
+        """Put an item in the queue, replacing any existing item."""
+        # With maxsize=1, putting a new item will automatically discard the old one
+        try:
+            self._queue.put(item, block=False)
+        except:
+            # If queue is full, empty it first, then put the new item
+            try:
+                self._queue.get_nowait()
+            except:
+                pass
+            self._queue.put(item, block=False)
+
+    def get(self, block=True, timeout=None):
+        """Get the latest item from the queue."""
+        if not block:
+            return self.get_nowait()
+
+        # Use the underlying multiprocessing queue
+        return self._queue.get(block=block, timeout=timeout)
+
+    def get_nowait(self):
+        """Get the latest item without blocking."""
+        return self._queue.get_nowait()
+
+    def empty(self):
+        """Check if the queue is empty."""
+        return self._queue.empty()
+
+    def qsize(self):
+        """Return the approximate size of the queue (0 or 1)."""
+        return self._queue.qsize()
+
+    def full(self):
+        """Queue is never full since it only keeps one item."""
+        return False
+
+# Constants
+DEFAULT_ALGORITHM = "md5"
+CONFIG_FILE = os.path.expanduser("~/.filehasher")
+
+# Supported algorithms
+ALGORITHMS = {
+    "md5": hashlib.md5,
+    "sha1": hashlib.sha1,
+    "sha256": hashlib.sha256,
+    "sha512": hashlib.sha512,
+    "blake2b": hashlib.blake2b,
+    "blake2s": hashlib.blake2s,
 }
 
-DEFAULT_ALGORITHM = 'md5'
-CONFIG_FILE = '.filehasher.ini'
+def _asserted_open(filename: str, mode: str):
+    """Open file with proper error handling."""
+    try:
+        return open(filename, mode)
+    except OSError as e:
+        print(f"Error opening {filename}: {e}")
+        raise
 
+def _create_hash_key(filepath: str, directory: Optional[str] = None) -> str:
+    """Create a hash key for the file."""
+    if directory:
+        # Make path relative to the specified directory
+        rel_path = os.path.relpath(filepath, directory)
+    else:
+        rel_path = os.path.relpath(filepath)
+    
+    # Normalize path separators
+    return rel_path.replace(os.sep, "/")
 
-def _process_file_worker(file_info: Tuple[str, str, str, str, str, bool, bool]) -> Tuple[str, str, str, str, str, str, Optional[str]]:
-    """
-    Worker function for parallel file processing.
-    Returns (hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename)
-    """
-    subdir, filename, full_filename, algorithm, update, append, verbose = file_info
-
-    if os.path.islink(full_filename):
-        return None  # Skip symlinks
-
-    file_stat = os.stat(full_filename)
-    file_size = file_stat.st_size
-    file_inode = file_stat.st_ino
-
-    key = f"{full_filename}{file_size}{file_stat.st_mtime}"
-    hashkey = _get_hash(key, algorithm)
-
-    processed_filename = full_filename if verbose else None
+def _calculate_hash(filepath: str, algorithm: str, verbose: bool = False) -> str:
+    """Calculate hash of a file."""
+    hash_func = ALGORITHMS[algorithm]
+    hasher = hash_func()
 
     try:
-        with open(full_filename, "rb") as f:
-            hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
-        hexdigest = hashsum.hexdigest()
-    except Exception as e:
-        print(f"Error processing {full_filename}: {e}")
-        return None
-
-    return hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename
-
-
-def _collect_files(hash_file: str, collect_paths: bool = False) -> Union[int, List[Tuple[str, str, str]]]:
-    """
-    Collect files from current directory for processing.
-
-    Args:
-        hash_file: Name of the hash file to exclude
-        collect_paths: If True, return list of (subdir, filename, full_filename)
-                      If False, return count of files only
-
-    Returns:
-        If collect_paths is False: total file count (int)
-        If collect_paths is True: list of file tuples
-    """
-    result = [] if collect_paths else 0
-
-    for subdir, dirs, files in os.walk("."):
-        if subdir == ".uma":
-            continue
-        if ".uma" in dirs:
-            dirs.remove(".uma")
-
-        for filename in files:
-            if subdir == "." and (filename == hash_file or filename == hash_file + ".new"):
-                continue
-            full_filename = os.path.join(subdir, filename)
-            if not os.path.islink(full_filename):
-                if collect_paths:
-                    result.append((subdir, filename, full_filename))
-                else:
-                    result += 1
-
-    return result
-
-
-def _process_worker_batch(worker_files: List[Tuple[str, str, str]], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue: Optional['mp.Queue'] = None) -> List[Tuple]:
-    """
-    Process a batch of files for a single worker.
-    This function runs in a separate process.
-    """
-    results = []
-
-    for subdir, filename, full_filename in worker_files:
-        if os.path.islink(full_filename):
-            # Send progress update even for skipped files
-            if progress_queue:
-                progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
-            continue
-
-        file_stat = os.stat(full_filename)
-        file_size = file_stat.st_size
-        file_inode = file_stat.st_ino
-
-        key = f"{full_filename}{file_size}{file_stat.st_mtime}"
-        hashkey = _get_hash(key, algorithm)
-
-        processed_filename = full_filename if verbose else None
-
-        try:
-            with open(full_filename, "rb") as f:
-                hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
-            hexdigest = hashsum.hexdigest()
-
-            results.append((hashkey, hexdigest, subdir, filename, str(file_size), str(file_inode), processed_filename))
-        except Exception as e:
-            print(f"Error processing {full_filename}: {e}")
-            continue
-
-        # Send progress update for each processed file
-        if progress_queue:
-            progress_queue.put(('progress', worker_id, 1, filename if verbose else None))
-
-    # Signal completion
-    if progress_queue:
-        progress_queue.put(('done', worker_id))
-
-    return results
-
-
-def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
-    """Generate hash for a string using specified algorithm."""
-    hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
-    return hash_func(s.encode("utf-8", "backslashreplace")).hexdigest()
-
-
-def calculate_hash(f, algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True) -> Tuple[Any, bool]:
-    """Calculate hash for a file using specified algorithm."""
-    hash_func = SUPPORTED_ALGORITHMS.get(algorithm, hashlib.md5)
-    hashsum = hash_func()
-    readcount = 0
-    dirty = False
-
-    while True:
-        block = f.read(BLOCKSIZE)
-        if not block:
-            break
-        readcount += 1
-        if show_progress and readcount > 10 and readcount % 23 == 0:
-            if dirty:
-                sys.stdout.write("\b")
-            dirty = True
-            sys.stdout.write(("/", "|", "\\", "-")[readcount % 4])
-            sys.stdout.flush()
-        hashsum.update(block)
-
-    return hashsum, dirty
-
-
-# Backward compatibility
-def _getMD5(s):
-    return _get_hash(s, 'md5')
-
-
-def calculate_md5(f):
-    return calculate_hash(f, 'md5')
-
-
-def benchmark_algorithms(test_file: str = None, algorithms: List[str] = None,
-                        iterations: int = 3) -> Dict[str, Dict[str, float]]:
-    """
-    Benchmark different hash algorithms on a test file or sample data.
-
-    Returns a dictionary with algorithm names as keys and performance metrics as values.
-    """
-    if algorithms is None:
-        algorithms = list(SUPPORTED_ALGORITHMS.keys())
-
-    if test_file and os.path.exists(test_file):
-        print(f"Benchmarking algorithms using file: {test_file}")
-        with open(test_file, "rb") as f:
-            test_data = f.read()
-    else:
-        # Use sample data if no test file provided
-        test_data = b"x" * (10 * 1024 * 1024)  # 10MB of data
-        print("Benchmarking algorithms using 10MB sample data")
-
-    results = {}
-
-    for algorithm in algorithms:
-        if algorithm not in SUPPORTED_ALGORITHMS:
-            print(f"Warning: Unsupported algorithm '{algorithm}', skipping")
-            continue
-
-        times = []
-        print(f"Testing {algorithm}...")
-
-        for i in range(iterations):
-            start_time = time.time()
-            hash_func = SUPPORTED_ALGORITHMS[algorithm]
-            hasher = hash_func()
-
-            # Process data in chunks to simulate real file processing
-            for i in range(0, len(test_data), BLOCKSIZE):
-                chunk = test_data[i:i + BLOCKSIZE]
+        with open(filepath, 'rb') as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
                 hasher.update(chunk)
+    except OSError as e:
+        if verbose:
+            print(f"Error reading {filepath}: {e}")
+        raise
 
-            end_time = time.time()
-            times.append(end_time - start_time)
+    return hasher.hexdigest()
 
-        avg_time = sum(times) / len(times)
-        results[algorithm] = {
-            'average_time': avg_time,
-            'min_time': min(times),
-            'max_time': max(times),
-            'throughput_mb_per_sec': (len(test_data) / (1024 * 1024)) / avg_time
-        }
+def _collect_files(hash_file: str, collect_paths: bool = False, collect_sizes: bool = False, directory: Optional[str] = None, verbose: bool = False) -> Union[int, List[Tuple[str, int]]]:
+    """Collect files to process. Returns count or list of (path, size) tuples."""
+    files = []
+    start_dir = directory if directory else "."
+    
+    for subdir, dirs, filenames in os.walk(start_dir):
+        # Skip .git directories
+        if '.git' in dirs:
+            dirs.remove('.git')
+        
+        for filename in filenames:
+            filepath = os.path.join(subdir, filename)
+            
+            # Skip the hash file itself
+            if os.path.abspath(filepath) == os.path.abspath(hash_file):
+                continue
+            
+            # Skip hidden files and directories
+            if filename.startswith('.'):
+                continue
+            
+            # Get file size
+            try:
+                file_size = os.path.getsize(filepath)
+            except OSError as e:
+                if verbose:
+                    print(f"Skipping inaccessible file: {filepath} ({e})")
+                continue
+            
+            if collect_paths:
+                if collect_sizes:
+                    files.append((filepath, file_size))
+                else:
+                    files.append(filepath)
+            else:
+                files.append(filepath)
+    
+    if collect_paths:
+        return files
+    else:
+        return len(files)
+
+def _distribute_files_by_size(files_with_sizes: List[Tuple[str, int]], workers: int, verbose: bool = False) -> List[List[str]]:
+    """Distribute files among workers based on size for balanced workload."""
+    if not files_with_sizes:
+        return [[] for _ in range(workers)]
+    
+    # Sort files by size (largest first) for greedy distribution
+    sorted_files = sorted(files_with_sizes, key=lambda x: x[1], reverse=True)
+    
+    # Initialize worker lists and total sizes
+    worker_lists = [[] for _ in range(workers)]
+    worker_sizes = [0] * workers
+    
+    # Greedy distribution: assign each file to the worker with smallest total size
+    for filepath, file_size in sorted_files:
+        # Find worker with smallest total size
+        min_worker = min(range(workers), key=lambda i: worker_sizes[i])
+        worker_lists[min_worker].append(filepath)
+        worker_sizes[min_worker] += file_size
+    
+    # Print distribution info if verbose
+    if verbose:
+        total_size = sum(worker_sizes)
+        print(f"Size-aware distribution: {len(files_with_sizes)} files, {total_size/1024/1024:.1f}MB total")
+        for i, (files, size) in enumerate(zip(worker_lists, worker_sizes)):
+            percentage = (size / total_size * 100) if total_size > 0 else 0
+            print(f"  Worker {i+1}: {len(files)} files, {size/1024/1024:.1f}MB ({percentage:.1f}%)")
+
+    # Randomize each worker's file list to better distribute load over time
+    import random
+    for i in range(workers):
+        random.shuffle(worker_lists[i])
+
+    return worker_lists
+
+def _can_skip_file(hashkey: str, file_size: int, file_inode: int, file_mtime: float, cache: Dict, file_stat: Optional[Any] = None) -> bool:
+    """Check if we can skip hashing this file."""
+    if hashkey not in cache:
+        return False
+    
+    cached_data = cache[hashkey]
+    if len(cached_data) < 6:
+        # Old format without timestamp, always re-process
+        return False
+    
+    cached_size, cached_inode, cached_mtime = cached_data[3], cached_data[4], cached_data[5]
+    
+    # Don't skip if timestamps are invalid (before 1990 or 0)
+    if cached_mtime == 0 or cached_mtime < 631152000:  # Jan 1, 1990
+        return False
+    
+    return (cached_size == file_size and 
+            cached_inode == file_inode and 
+            cached_mtime == file_mtime)
+
+def _process_worker_batch(worker_files: List[str], algorithm: str, update: bool, append: bool, verbose: bool, worker_id: int, progress_queue, cache: Dict, writer_queue=None, debug: bool = False) -> List[Tuple]:
+    """Process a batch of files in a worker process."""
+    if debug:
+        print(f"DEBUG: Worker {worker_id} started with {len(worker_files)} files")
+    results = []
+    files_processed = 0
+
+    for filepath in worker_files:
+        try:
+            if debug:
+                print(f"DEBUG: Worker {worker_id} processing file: {filepath}")
+
+            # Get file metadata
+            file_stat = os.stat(filepath)
+            file_size = file_stat.st_size
+            file_inode = file_stat.st_ino
+            file_mtime = file_stat.st_mtime
+
+            # Create hash key
+            hashkey = _create_hash_key(filepath)
+
+            if debug:
+                print(f"DEBUG: Worker {worker_id} created hashkey: {hashkey}")
+
+            # Check if we can skip this file
+            can_skip = _can_skip_file(hashkey, file_size, file_inode, file_mtime, cache, file_stat)
+            if debug:
+                print(f"DEBUG: Worker {worker_id} can_skip: {can_skip}")
+
+            if can_skip:
+                if verbose:
+                    progress_queue.put(('verbose', f"Skipped {os.path.basename(filepath)}"))
+                continue
+
+            # Send start processing message
+            progress_queue.put(('start_processing', os.path.basename(filepath)))
+
+            # Calculate hash
+            hexdigest = _calculate_hash(filepath, algorithm, verbose)
+            if debug:
+                print(f"DEBUG: Worker {worker_id} calculated hash: {hexdigest[:16]}...")
+
+            # Send processing message
+            progress_queue.put(('processing', os.path.basename(filepath)))
+
+            # Get relative paths
+            subdir = os.path.dirname(filepath)
+            filename = os.path.basename(filepath)
+
+            # Increment processed count and send progress message with count
+            files_processed += 1
+            if debug:
+                print(f"DEBUG: Worker {worker_id} sending progress message: ('progress', '{os.path.basename(filepath)}', {files_processed})")
+            progress_queue.put(('progress', os.path.basename(filepath), files_processed))
+
+            # Send result directly to writer queue if available
+            if writer_queue is not None:
+                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
+                output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}|{file_mtime}"
+                if debug:
+                    print(f"DEBUG: Worker {worker_id} sending to writer queue: {output[:50]}...")
+                try:
+                    writer_queue.put(output)
+                    if debug:
+                        print(f"DEBUG: Worker {worker_id} successfully sent result to writer queue")
+                except Exception as e:
+                    if verbose:
+                        progress_queue.put(('verbose', f"Error sending to writer queue: {e}"))
+
+            # Return result for backward compatibility
+            result = (hashkey, hexdigest, subdir, filename, file_size, file_inode, file_mtime, filepath)
+            results.append(result)
+
+        except Exception as e:
+            if verbose:
+                progress_queue.put(('verbose', f"Error processing {filepath}: {e}"))
+            continue
 
     return results
 
+class WriterThread:
+    """Dedicated thread for writing hash results to file."""
+    
+    def __init__(self, hash_file: str, update: bool, append: bool, algorithm: str, write_frequency: int = 100):
+        self.hash_file = hash_file
+        self.update = update
+        self.append = append
+        self.algorithm = algorithm
+        self.write_frequency = write_frequency
+        self.outfile = None
+        self.new_hash_file = None
+        self.results_written = 0
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._cleanup_done = False
+        self._writer_queue = None  # Will be set to multiprocessing.Queue
+        
+    def start(self, writer_queue=None):
+        """Start the writer thread."""
+        self.new_hash_file = self.hash_file + ".new"
+        self._writer_queue = writer_queue
+        
+        if self.update:
+            # Create a new file with algorithm header
+            self.outfile = _asserted_open(self.new_hash_file, "w")
+            self.outfile.write(f"# Algorithm: {self.algorithm}\n")
+        else:
+            if self.append:
+                # Only appends new hashes
+                self.outfile = _asserted_open(self.hash_file, "a")
+            else:
+                # Create a new file with algorithm header
+                self.outfile = _asserted_open(self.hash_file, "w")
+                self.outfile.write(f"# Algorithm: {self.algorithm}\n")
+        
+        # Register cleanup function
+        atexit.register(self._cleanup)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        # Start the writer thread
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+        
+        return self
+    
+    def stop(self):
+        """Stop the writer thread."""
+        self._stop_event.set()
+        # Send sentinel value to stop the writer loop
+        try:
+            self._writer_queue.put(None)
+        except Exception:
+            pass
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._cleanup()
+    
+    def send_result(self, result_data: str):
+        """Send a result to the writer thread."""
+        try:
+            self._writer_queue.put(result_data)
+        except Exception as e:
+            print(f"⚠️  Error sending result to writer: {e}")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle interruption signals."""
+        print(f"\n⚠️  Process interrupted (signal {signum}). Saving progress...")
+        self._cleanup()
+        # Force exit to prevent hanging
+        os._exit(1)
+    
+    def _cleanup(self):
+        """Clean up file handles and rename if needed."""
+        if self._cleanup_done or not self.outfile:
+            return
+            
+        self._cleanup_done = True
+        try:
+            self.outfile.flush()
+            self.outfile.close()
+            if self.update and self.new_hash_file and os.path.exists(self.new_hash_file):
+                # Only rename if we have some content (more than just the header)
+                if os.path.getsize(self.new_hash_file) > len(f"# Algorithm: {self.algorithm}\n"):
+                    os.rename(self.new_hash_file, self.hash_file)
+                    print(f"✅ Progress saved to {self.hash_file}")
+                else:
+                    os.remove(self.new_hash_file)
+                    print("⚠️  No progress to save (only header written)")
+            elif not self.update and not self.append:
+                # For generate mode, check if we have content beyond the header
+                if os.path.exists(self.hash_file) and os.path.getsize(self.hash_file) > len(f"# Algorithm: {self.algorithm}\n"):
+                    print(f"✅ Progress saved to {self.hash_file}")
+                else:
+                    print("⚠️  No progress to save (only header written)")
+        except Exception as e:
+            print(f"⚠️  Error during cleanup: {e}")
+        finally:
+            self.outfile = None
+    
+    def _writer_loop(self):
+        """Main writer loop that processes results from the queue."""
+        while not self._stop_event.is_set():
+            try:
+                # Get result from queue with timeout
+                result_data = self._writer_queue.get(timeout=0.1)
+                if result_data is None:  # Sentinel value to stop
+                    break
 
-def load_config() -> Dict[str, Any]:
-    """
-    Load configuration from .filehasher.ini file.
+                # Write the result to file
+                if not self.outfile or self._cleanup_done:
+                    continue
 
-    Returns a dictionary with configuration values.
-    """
-    config = configparser.ConfigParser()
-    config.read(CONFIG_FILE)
+                try:
+                    self.outfile.write(result_data + "\n")
+                    self.results_written += 1
 
-    if not config.has_section('filehasher'):
-        config.add_section('filehasher')
+                    # Flush periodically
+                    if self.results_written % self.write_frequency == 0:
+                        self.outfile.flush()
+                except Exception as e:
+                    print(f"⚠️  Error writing result: {e}")
 
-    # Set defaults if not present
-    if not config.has_option('filehasher', 'default_algorithm'):
-        config.set('filehasher', 'default_algorithm', DEFAULT_ALGORITHM)
-
-    if not config.has_option('filehasher', 'benchmark_iterations'):
-        config.set('filehasher', 'benchmark_iterations', '3')
-
-    if not config.has_option('filehasher', 'quiet'):
-        config.set('filehasher', 'quiet', 'false')
-
-    return {
-        'default_algorithm': config.get('filehasher', 'default_algorithm'),
-        'benchmark_iterations': config.getint('filehasher', 'benchmark_iterations'),
-        'quiet': config.getboolean('filehasher', 'quiet'),
-    }
-
-
-def save_config(config_dict: Dict[str, Any]) -> None:
-    """
-    Save configuration to .filehasher.ini file.
-    """
-    config = configparser.ConfigParser()
-    config.add_section('filehasher')
-
-    for key, value in config_dict.items():
-        config.set('filehasher', str(key), str(value))
-
-    with open(CONFIG_FILE, 'w') as configfile:
-        config.write(configfile)
-
+                self._writer_queue.task_done()
+            except queue.Empty:
+                # No results available, continue
+                continue
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                # These are expected when the process is terminating - don't show errors
+                continue
+            except Exception as e:
+                # Only show unexpected errors
+                if not self._cleanup_done and str(e).strip():
+                    print(f"⚠️  Error in writer loop: {e}")
+                continue
 
 def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                    algorithm: str = DEFAULT_ALGORITHM, show_progress: bool = True,
-                   parallel: bool = False, workers: Optional[int] = None,
-                   verbose: bool = False) -> None:
-    """Generate hash file for all files in current directory tree."""
+                   workers: Optional[int] = None, verbose: bool = False, debug: bool = False,
+                   directory: Optional[str] = None, write_frequency: int = 100) -> None:
+    """Generate hash file for all files in specified directory tree.
+
+    Args:
+        hash_file: Path to the hash file to create/update
+        update: Whether to update existing hash file
+        append: Whether to append to existing hash file
+        algorithm: Hash algorithm to use
+        show_progress: Whether to show progress bars
+        workers: Number of parallel workers (default: CPU count)
+        verbose: Whether to show verbose output
+        debug: Whether to show debug output for troubleshooting
+        directory: Directory to process (default: current directory)
+        write_frequency: Write to file every N entries (default: 100)
+    """
+    # Set up signal handling for graceful shutdown
+    def signal_handler(signum, frame):
+        print(f"\n⚠️  Process interrupted (signal {signum}). Shutting down...")
+        os._exit(1)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Validate directory if provided
+    if directory and not os.path.exists(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    if directory and not os.path.isdir(directory):
+        raise NotADirectoryError(f"Path is not a directory: {directory}")
+
+    # Load existing hash file if updating
     cache = {}
-    existing_algorithm = None
-
-    if (append or update) and os.path.exists(hash_file):
-        _, existing_algorithm = _load_hashfile(hash_file, cache_data=cache)
-
-        # Check for algorithm mismatch
-        if existing_algorithm and existing_algorithm != algorithm:
-            print(f"⚠️  WARNING: Algorithm mismatch detected!")
-            print(f"   Existing hash file uses: {existing_algorithm}")
-            print(f"   Requested algorithm: {algorithm}")
-            print(f"   This may cause inconsistent hash comparisons.")
-            response = input("   Continue anyway? (y/N): ").strip().lower()
-            if response not in ('y', 'yes'):
-                print("   Operation cancelled.")
-                return
-
-    new_hash_file = hash_file + ".new"
-
-    if update:
-        # Create a new file with algorithm header and only needed hashes
-        outfile = _asserted_open(new_hash_file, "w")
-        outfile.write(f"# Algorithm: {algorithm}\n")
-    else:
-        if append:
-            # Only appends new hashes
-            outfile = _asserted_open(hash_file, "a")
-        else:
-            # Create a new file with algorithm header
-            outfile = _asserted_open(hash_file, "w")
-            outfile.write(f"# Algorithm: {algorithm}\n")
+    if update and os.path.exists(hash_file):
+        cache, _ = _load_hashfile(hash_file, cache_data=cache)
+        if verbose:
+            print(f"Loaded {len(cache)} existing hashes from {hash_file}")
+    elif append and os.path.exists(hash_file):
+        cache, _ = _load_hashfile(hash_file, cache_data=cache)
+        if verbose:
+            print(f"Loaded {len(cache)} existing hashes from {hash_file}")
 
     # Count total files first for progress tracking (much faster than collecting all)
-    total_files = _collect_files(hash_file, collect_paths=False)
+    total_files = _collect_files(hash_file, collect_paths=False, directory=directory)
+    if debug:
+        print(f"DEBUG: Found {total_files} total files to process")
 
-
-    # Determine number of workers
-    if parallel:
-        if workers is None:
-            workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
-        else:
-            workers = min(workers, total_files) if total_files > 0 else 1
+    # Determine number of workers (always use parallel, default to 1 worker if not specified)
+    if workers is None:
+        workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
     else:
-        workers = 1
+        workers = min(workers, total_files) if total_files > 0 else 1
+
+    # Start the writer thread for parallel processing
+    writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency)
 
     # Use Rich progress bars for parallel processing with individual worker progress
-    if parallel and show_progress and HAS_RICH:
+    if show_progress:
         import threading
         console = Console()
 
@@ -352,422 +513,333 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         ) as progress:
             # Create progress tasks for each worker with correct totals
             worker_tasks = []
-            files_per_worker = total_files // workers
-            extra_files = total_files % workers
-
+            # We'll update these totals after we know the actual distribution
             for i in range(workers):
-                worker_total = files_per_worker
-                if i < extra_files:
-                    worker_total += 1
-                task = progress.add_task(f"Worker {i+1}", total=worker_total, filename="")
+                task = progress.add_task(f"Worker {i+1}", total=0, filename="")
                 worker_tasks.append(task)
 
-            # Create progress queues for real-time updates using Manager
+            # Create LatestOnlyQueues for direct inter-process and UI communication
             with mp.Manager() as manager:
-                progress_queues = [manager.Queue() for _ in range(workers)]
+                progress_queues = [LatestOnlyQueue(manager) for _ in range(workers)]
                 worker_completed = manager.list([False] * workers)
+                
+                # Create multiprocessing queue for direct worker-to-writer communication
+                writer_queue = manager.Queue()
+                
+                # Start the writer thread with the multiprocessing queue
+                writer_thread.start(writer_queue)
 
                 # Process files on-the-fly with parallel workers using shared list
                 with ProcessPoolExecutor(max_workers=workers) as executor:
-                    # Collect all files for processing
-                    all_files = _collect_files(hash_file, collect_paths=True)
+                    # Collect all files with sizes for balanced distribution
+                    all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory, verbose=verbose)
 
-                    # Distribute files among workers more evenly
-                    files_per_worker = len(all_files) // workers
-                    extra_files = len(all_files) % workers
+                    # Distribute files among workers based on size for balanced workload
+                    worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
 
-                    worker_file_lists = []
-                    start_idx = 0
-                    for i in range(workers):
-                        worker_files = files_per_worker
-                        if i < extra_files:
-                            worker_files += 1
-                        end_idx = start_idx + worker_files
-                        worker_file_lists.append(all_files[start_idx:end_idx])
-                        start_idx = end_idx
+                    # Update progress bar totals with actual file counts per worker
+                    for i, worker_files in enumerate(worker_file_lists):
+                        progress.update(worker_tasks[i], total=len(worker_files))
 
                     # Submit all worker tasks at once
                     future_to_worker = {}
                     for worker_id, worker_files in enumerate(worker_file_lists):
                         if worker_files:  # Only create task if worker has files
-                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id])
+                            future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id], cache, writer_queue, debug)
                             future_to_worker[future] = worker_id
 
-                    # Function to monitor progress queues
+                    # Function to monitor progress queues with batching for better UI sync
                     def monitor_progress():
-                        while not all(worker_completed):
-                            for worker_id in range(workers):
-                                if worker_completed[worker_id]:
-                                    continue
-                                try:
-                                    message = progress_queues[worker_id].get_nowait()
-                                    if message[0] == 'progress':
-                                        _, wid, advance, filename = message
-                                        progress.update(worker_tasks[wid], advance=advance,
-                                                      filename=os.path.basename(filename) if verbose and filename else "")
-                                    elif message[0] == 'done':
-                                        worker_completed[message[1]] = True
-                                except queue.Empty:
-                                    # Queue is empty, continue monitoring
-                                    pass
-                            time.sleep(0)  # Yield control to avoid busy waiting
+                        try:
+                            import time
+
+                            # Keep monitoring until all workers are actually completed
+                            while True:
+                                # Check if all workers are completed
+                                if all(worker_completed):
+                                    # Process any remaining messages before exiting
+                                    for worker_id in range(workers):
+                                        try:
+                                            while True:
+                                                message = progress_queues[worker_id].get_nowait()
+                                                if message[0] == 'progress' and len(message) > 2:
+                                                    progress_count = message[2]
+                                                    # Get current progress to calculate how much to advance
+                                                    current_progress = progress.tasks[worker_tasks[worker_id]].completed
+                                                    advance_amount = progress_count - current_progress
+                                                    if advance_amount > 0:
+                                                        progress.update(worker_tasks[worker_id], advance=advance_amount, filename=message[1])
+                                                        progress.refresh()
+                                                        console.file.flush()
+                                        except queue.Empty:
+                                            break
+                                        except Exception:
+                                            break
+                                    break
+
+                                # Process messages from ALL workers (not just active ones)
+                                last_progress_update = {}  # Track last update time per worker
+                                for worker_id in range(workers):
+                                    try:
+                                        # Use blocking get with longer timeout for better responsiveness
+                                        if debug:
+                                            print(f"DEBUG: UI trying to get message from worker {worker_id}")
+                                        message = progress_queues[worker_id].get(timeout=0.01)
+                                        if debug:
+                                            print(f"DEBUG: Processing message from worker {worker_id}: {message}")
+
+                                        if message[0] == 'start_processing':
+                                            # Worker started processing a file
+                                            progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
+                                        elif message[0] == 'processing':
+                                            # Worker is processing a file
+                                            progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}", filename=message[1])
+                                        elif message[0] == 'progress':
+                                            if debug:
+                                                progress_count = message[2] if len(message) > 2 else 1
+                                                print(f"DEBUG: Progress update - worker {worker_id}, count: {progress_count}, file: {message[1]}")
+
+                                            # Handle progress updates with throttling
+                                            progress_count = message[2] if len(message) > 2 else 1
+                                            current_time = time.time()
+
+                                            # Throttle progress updates to at most once every 50ms per worker
+                                            if worker_id not in last_progress_update or (current_time - last_progress_update[worker_id]) >= 0.05:
+                                                last_progress_update[worker_id] = current_time
+
+                                                # Get current progress to calculate how much to advance
+                                                current_progress = progress.tasks[worker_tasks[worker_id]].completed
+                                                advance_amount = progress_count - current_progress
+
+                                                if advance_amount > 0:
+                                                    progress.update(worker_tasks[worker_id], advance=advance_amount, filename=message[1])
+                                                    # Force refresh for progress updates
+                                                    #progress.refresh()
+                                                    # Force console flush to ensure immediate display
+                                                    #console.file.flush()
+                                        elif message[0] == 'verbose':
+                                            # Verbose message from worker - show in progress bar description
+                                            progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}: {message[1]}")
+                                    except queue.Empty:
+                                        continue
+                                    except Exception as e:
+                                        # Ignore errors during cleanup
+                                        pass
+
+                                # Small delay to prevent busy waiting
+                                time.sleep(0.01)
+                        except Exception as e:
+                            # Ignore errors during cleanup
+                            pass
 
                     # Start progress monitoring thread
                     monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
                     monitor_thread.start()
 
-                    # Process results as they complete
+                    # Wait for all workers to complete (results are sent directly to writer queue)
+                    completed_workers = 0
                     for future in as_completed(future_to_worker):
                         worker_id = future_to_worker[future]
                         try:
-                            batch_results = future.result()
-                            for result in batch_results:
-                                if result:
-                                    hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
-                                    filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-                                    subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-
-                                    if hashkey in cache:
-                                        if update:
-                                            cache_data = cache.pop(hashkey)
-                                            output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
-                                            outfile.write(output + "\n")
-                                    else:
-                                        output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
-                                        outfile.write(output + "\n")
+                            # Just wait for worker to complete - results are sent directly to writer queue
+                            future.result()
+                            # Mark this specific worker as completed
+                            worker_completed[worker_id] = True
+                            completed_workers += 1
+                            if verbose:
+                                print(f"Worker {worker_id+1} completed ({completed_workers}/{workers})")
 
                         except Exception as e:
                             print(f"Error in worker {worker_id}: {e}")
-                            # Mark worker as completed to avoid hanging
+                            # Mark this specific worker as completed even if it errored
                             worker_completed[worker_id] = True
+                            completed_workers += 1
 
-                    # Wait for progress monitoring to complete
+                    # Wait for progress monitoring to complete (no timeout to ensure it finishes)
                     monitor_thread.join()
 
-    elif parallel and show_progress and HAS_TQDM:
-        # Fallback to tqdm for parallel processing with progress queues
-        import threading
-        progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
-
-        # Collect all files for tqdm implementation
-        all_files = _collect_files(hash_file, collect_paths=True)
-
-        # Distribute files among workers
-        files_per_worker = len(all_files) // workers
-        extra_files = len(all_files) % workers
-
-        worker_file_lists = []
-        start_idx = 0
-        for i in range(workers):
-            worker_files = files_per_worker
-            if i < extra_files:
-                worker_files += 1
-            end_idx = start_idx + worker_files
-            worker_file_lists.append(all_files[start_idx:end_idx])
-            start_idx = end_idx
-
-        # Create progress queues for real-time updates using Manager
+                    # Ensure all progress bars show 100% completion
+                    for i, worker_files in enumerate(worker_file_lists):
+                        if worker_files:
+                            progress.update(worker_tasks[i], completed=len(worker_files))
+                    
+                    # Wait for writer queue to be empty to ensure all results are processed
+                    if verbose:
+                        print("Waiting for writer queue to empty...")
+                    import time
+                    while not writer_queue.empty():
+                        time.sleep(0.1)
+                    if verbose:
+                        print("Writer queue is empty, all results processed.")
+    else:
+        # No progress display - still use multiprocessing queue for direct communication
         with mp.Manager() as manager:
-            progress_queues = [manager.Queue() for _ in range(workers)]
-            worker_completed = manager.list([False] * workers)
-
+            # Create multiprocessing queue for direct worker-to-writer communication
+            writer_queue = manager.Queue()
+            
+            # Start the writer thread with the multiprocessing queue
+            writer_thread.start(writer_queue)
+            
+            # Process files with parallel workers
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Submit worker tasks
+                # Collect all files with sizes for balanced distribution
+                all_files_with_sizes = _collect_files(hash_file, collect_paths=True, collect_sizes=True, directory=directory, verbose=verbose)
+                
+                # Distribute files among workers based on size for balanced workload
+                worker_file_lists = _distribute_files_by_size(all_files_with_sizes, workers, verbose)
+                
+                # Submit all worker tasks at once
                 future_to_worker = {}
                 for worker_id, worker_files in enumerate(worker_file_lists):
-                    if worker_files:
-                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, progress_queues[worker_id])
+                    if worker_files:  # Only create task if worker has files
+                        # Create dummy progress queue for workers
+                        dummy_queue = manager.Queue()
+                        future = executor.submit(_process_worker_batch, worker_files, algorithm, update, append, verbose, worker_id, dummy_queue, cache, writer_queue, debug)
                         future_to_worker[future] = worker_id
 
-                # Function to monitor progress queues
-                def monitor_progress():
-                    while not all(worker_completed):
-                        for worker_id in range(workers):
-                            if worker_completed[worker_id]:
-                                continue
-                            try:
-                                message = progress_queues[worker_id].get_nowait()
-                                if message[0] == 'progress':
-                                    _, wid, advance, filename = message
-                                    if verbose and filename:
-                                        progress_bar.set_description(f"Worker {wid+1}: {os.path.basename(filename)}")
-                                    progress_bar.update(advance)
-                                elif message[0] == 'done':
-                                    worker_completed[message[1]] = True
-                            except queue.Empty:
-                                # Queue is empty, continue monitoring
-                                pass
-                        time.sleep(0)  # Yield control to avoid busy waiting
-
-                # Start progress monitoring thread
-                monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
-                monitor_thread.start()
-
-                # Process results
+                # Wait for all workers to complete
                 for future in as_completed(future_to_worker):
-                    worker_id = future_to_worker[future]
                     try:
-                        batch_results = future.result()
-                        for result in batch_results:
-                            if result:
-                                hashkey, hexdigest, subdir, filename, file_size, file_inode, processed_filename = result
-                                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-                                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-
-                                if hashkey in cache:
-                                    if update:
-                                        cache_data = cache.pop(hashkey)
-                                        output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
-                                        outfile.write(output + "\n")
-                                else:
-                                    output = f"{hashkey}|{hexdigest}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
-                                    outfile.write(output + "\n")
-
+                        future.result()
                     except Exception as e:
-                        print(f"Error in worker {worker_id}: {e}")
-                        # Mark worker as completed to avoid hanging
-                        worker_completed[worker_id] = True
+                        print(f"Error in worker: {e}")
 
-                # Wait for progress monitoring to complete
-                monitor_thread.join()
-
-        progress_bar.close()
-
-    else:
-        # Sequential processing (original logic)
-        if show_progress and HAS_TQDM and not parallel:
-            progress_bar = tqdm(total=total_files, desc="Processing files", unit="file")
-        else:
-            progress_bar = None
-
-        processed_count = 0
-
-        for subdir, dirs, files in os.walk("."):
-            if not files:
-                continue
-            if subdir == ".uma":
-                continue
-            if ".uma" in dirs:
-                dirs.remove(".uma")
-
-            for filename in files:
-                if subdir == "." and (filename == hash_file or filename == new_hash_file):
-                    continue
-                full_filename = os.path.join(subdir, filename)
-
-                if os.path.islink(full_filename):
-                    continue
-
-                file_stat = os.stat(full_filename)
-                file_size = file_stat.st_size
-                file_inode = file_stat.st_ino
-
-                key = f"{full_filename}{file_size}{file_stat.st_mtime}"
-                hashkey = _get_hash(key, algorithm)
-                filename_encoded = (filename.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-                subdir_encoded = (subdir.encode("utf-8", "backslashreplace")).decode("iso8859-1")
-
-                if hashkey in cache:
-                    if update:
-                        cache_data = cache.pop(hashkey)
-                        output = f"{hashkey}|{cache_data[0]}|{subdir_encoded}|{filename_encoded}|{cache_data[3]}|{cache_data[4]}"
-                        outfile.write(output + "\n")
-                else:
-                    try:
-                        with open(full_filename, "rb") as f:
-                            hashsum, _ = calculate_hash(f, algorithm, show_progress=False)
-                    except Exception as e:
-                        print(f"Error processing {full_filename}: {e}")
-                        if progress_bar:
-                            progress_bar.update(1)
-                        continue
-
-                    output = f"{hashkey}|{hashsum.hexdigest()}|{subdir_encoded}|{filename_encoded}|{file_size}|{file_inode}"
-                    outfile.write(output + "\n")
-
-                processed_count += 1
-                if progress_bar:
-                    progress_bar.update(1)
-
-        if progress_bar:
-            progress_bar.close()
-
-    outfile.close()
-    if update:
-        os.rename(new_hash_file, hash_file)
-        if cache:
-            print(f"{len(cache)} old cache entries cleaned.")
-            for key in cache:
-                cache_data = cache[key]
-                print(f"{key} -> {cache_data[1]}/{cache_data[2]}")
-
+    # Stop the writer thread
+    writer_thread.stop()
 
 def _load_hashfile(filename: str, destDict: Optional[Dict] = None,
                    cache_data: Optional[Dict] = None) -> Tuple[Dict, Optional[str]]:
     """Load hash file and populate destination dictionary. Returns (dict, algorithm)."""
-    f = _asserted_open(filename, "r")
-
     if destDict is None:
         destDict = {}
 
     algorithm = None
 
-    for line in f:
-        line = line.rstrip()
-        if not line:
-            continue
+    with open(filename, 'r') as f:
+        for line in f:
+            line = line.rstrip()
+            if not line:
+                continue
 
-        # Check for algorithm header
-        if line.startswith("# Algorithm: "):
-            algorithm = line[13:].strip()
-            continue
+            # Check for algorithm header
+            if line.startswith("# Algorithm: "):
+                algorithm = line[13:].strip()
+                continue
 
-        key, hashsum, dirname, filename, file_size, file_inode = line.split("|")
-        fileinfo = (dirname, filename, file_size, file_inode)
+            # Parse hash entry
+            parts = line.split("|")
+            if len(parts) >= 5:
+                hashkey = parts[0]
+                hexdigest = parts[1]
+                subdir = parts[2]
+                filename = parts[3]
+                file_size = int(parts[4])
+                file_inode = int(parts[5]) if len(parts) > 5 else 0
+                file_mtime = float(parts[6]) if len(parts) > 6 else 0
 
-        if hashsum in destDict:
-            if hashsum in repeated:
-                repeated[hashsum].append(fileinfo)
-            else:
-                repeated[hashsum] = [destDict[hashsum], fileinfo]
+                destDict[hashkey] = (hexdigest, subdir, filename, file_size, file_inode, file_mtime)
 
-        destDict[hashsum] = fileinfo
-
-        if cache_data is not None:
-            cache_data[key] = (hashsum, dirname, filename, file_size, file_inode)
-
-    f.close()
     return destDict, algorithm
 
+def _get_hash(s: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
+    """Get hash of a string."""
+    hash_func = ALGORITHMS[algorithm]
+    return hash_func(s.encode()).hexdigest()
 
-def compare(hashfile1: str, hashfile2: Optional[str] = None) -> None:
-    """Compare two hash files and generate synchronization commands."""
-    global output_file
-    output_file = None
-
-    hash_a, _ = _load_hashfile(hashfile1)
-    hash_b = {}
-    if hashfile2:
-        hash_b, _ = _load_hashfile(hashfile2)
-
-    commands = []
-    mkdirs = set()
-    rmdirs = set()
-    only_in_1 = {}
-
-    for hash_val in hash_a:
-        fdata1 = hash_a[hash_val]
-        fdata2 = None
-
-        if hash_val in hash_b:
-            fdata2 = hash_b[hash_val]
-            hash_b.pop(hash_val)
-        else:
-            only_in_1[hash_val] = fdata1
-            continue
-
-        if fdata2[0] == fdata1[0] and fdata2[1] == fdata1[1]:
-            # The files are the same
-            continue
-        else:
-            print(f"Different: {fdata1} vs {fdata2}")
-            if fdata1[0] == fdata2[0]:
-                # Same directory, only filename changed
-                commands.append(f"mv -v '{fdata1[0]}/{fdata1[1]}' '{fdata2[0]}/{fdata2[1]}'")
-            else:
-                # Directory changed and possibly filename too
-                mkdirs.add(f"mkdir -pv '{fdata2[0]}'")
-                if fdata1[0] != ".":
-                    rmdirs.add(f"rmdir -v '{fdata1[0]}'")
-
-                commands.append(f"mv -v '{fdata1[0]}/{fdata1[1]}' '{fdata2[0]}/{fdata2[1]}'")
-
-    if hashfile2:
-        if only_in_1:
-            print(f"\n# Those files only exist in {hashfile1}")
-            for item in _sorted_filenames(only_in_1):
-                print(item)
-
-        if hash_b:
-            print(f"\n# Those files only exist in {hashfile2}")
-            for item in _sorted_filenames(hash_b):
-                print(item)
-
-    if commands:
-        tee(output_file, "\n# Commands to execute in console:")
-
-        mkdirs_list = sorted(list(mkdirs))
-        rmdirs_list = sorted(list(rmdirs), reverse=True)
-        commands_sorted = sorted(commands)
-
-        tee(output_file, "\n# mkdir statements.\n")
-        for cmd in mkdirs_list:
-            tee(output_file, cmd)
-
-        tee(output_file, "\n# mv statements.\n")
-        for cmd in commands_sorted:
-            tee(output_file, cmd)
-
-        tee(output_file, "\n# Directories possibly empty from now. Please check.\n")
-        for cmd in rmdirs_list:
-            tee(output_file, f"#{cmd}")
-
-    if repeated:
-        tee(output_file, """
-# Those files are repeated. You can remove one or many of them if you wish.
-# (Note: if the inode is the same, there is no space wasted)
-""")
-        filenames = []
-        for item in repeated:
-            filenames.extend([(l[0], l[1], item) for l in repeated[item]])
-
-        filenames.sort()
-
-        while filenames:
-            item = filenames.pop(0)
-            item_key = item[2]
-
-            if item_key in repeated:
-                repeated_files = repeated.pop(item_key)
-                tee(output_file, f"\n# Key: {item_key} - Size: {repeated_files[0][2]}")
-
-                commands_set = set()
-                for repeated_file in repeated_files:
-                    commands_set.add(f"# rm '{repeated_file[0]}/{repeated_file[1]}' # inode: {repeated_file[3]}")
-
-                commands_list = sorted(list(commands_set))
-                tee(output_file, "\n".join(commands_list))
-
-    if output_file is not None:
-        output_file.close()
-
+def _getMD5(s):
+    """Get MD5 hash of a string (legacy function)."""
+    return _get_hash(s, "md5")
 
 def _sorted_filenames(filelist: Dict) -> List[str]:
-    """Sort filenames from file list dictionary."""
-    filenames = [os.path.join(filelist[item][0], filelist[item][1])
-                 for item in filelist]
-    filenames.sort()
-    return filenames
+    """Get sorted list of filenames from filelist dictionary."""
+    return sorted(filelist.keys())
 
+def compare(hashfile1: str, hashfile2: str) -> None:
+    """Compare two hash files and show differences."""
+    print(f"Comparing {hashfile1} and {hashfile2}...")
+    
+    # Load both hash files
+    dict1, _ = _load_hashfile(hashfile1)
+    dict2, _ = _load_hashfile(hashfile2)
+    
+    # Find differences
+    only_in_1 = set(dict1.keys()) - set(dict2.keys())
+    only_in_2 = set(dict2.keys()) - set(dict1.keys())
+    common = set(dict1.keys()) & set(dict2.keys())
+    
+    # Check for hash differences in common files
+    different_hashes = []
+    for filename in common:
+        if dict1[filename][0] != dict2[filename][0]:  # Compare hash values
+            different_hashes.append(filename)
+    
+    # Print results
+    print(f"\nFiles only in {hashfile1}: {len(only_in_1)}")
+    for filename in sorted(only_in_1):
+        print(f"  {filename}")
+    
+    print(f"\nFiles only in {hashfile2}: {len(only_in_2)}")
+    for filename in sorted(only_in_2):
+        print(f"  {filename}")
+    
+    print(f"\nFiles with different hashes: {len(different_hashes)}")
+    for filename in sorted(different_hashes):
+        print(f"  {filename}")
+    
+    print(f"\nFiles with identical hashes: {len(common) - len(different_hashes)}")
+    print(f"Total files in {hashfile1}: {len(dict1)}")
+    print(f"Total files in {hashfile2}: {len(dict2)}")
 
-def tee(o: Optional[Any], s: str) -> None:
-    """Write to file and print to stdout."""
-    global output_file
-    if o is None:
-        o = open(SCRIPT_FILENAME, "w")
-        output_file = o
+def benchmark_algorithms(test_file: Optional[str] = None, algorithms: Optional[List[str]] = None, iterations: int = 3) -> Dict:
+    """Benchmark hash algorithms."""
+    if algorithms is None:
+        algorithms = list(ALGORITHMS.keys())
+    
+    if test_file is None:
+        # Create test data
+        test_data = b"x" * (10 * 1024 * 1024)  # 10MB of data
+    else:
+        with open(test_file, 'rb') as f:
+            test_data = f.read()
+    
+    results = {}
+    
+    for algorithm in algorithms:
+        if algorithm not in ALGORITHMS:
+            continue
 
-    o.write(s + "\n")
-    print(s)
+        times = []
+        for _ in range(iterations):
+            start_time = time.time()
+            hash_func = ALGORITHMS[algorithm]
+            hasher = hash_func()
+            hasher.update(test_data)
+            hasher.hexdigest()
+            end_time = time.time()
+            times.append(end_time - start_time)
+        
+        avg_time = sum(times) / len(times)
+        min_time = min(times)
+        max_time = max(times)
+        throughput = len(test_data) / avg_time / 1024 / 1024  # MB/s
+        
+        results[algorithm] = {
+            'average_time': avg_time,
+            'min_time': min_time,
+            'max_time': max_time,
+            'throughput_mb_per_sec': throughput
+        }
+    
+    return results
 
+def load_config() -> Dict:
+    """Load configuration from file."""
+    config = configparser.ConfigParser()
+    if os.path.exists(CONFIG_FILE):
+        config.read(CONFIG_FILE)
+        return dict(config['DEFAULT'])
+    return {}
 
-def _asserted_open(filename: str, mode: str) -> Any:
-    """Open file with error handling."""
-    try:
-        return open(filename, mode)
-    except IOError as e:
-        print(f"I/O Error: {e}")
-        sys.exit(2)
-    except Exception as e:
-        print(f"Error: {e}")
-        raise e
+# Export supported algorithms
+SUPPORTED_ALGORITHMS = ALGORITHMS
+
