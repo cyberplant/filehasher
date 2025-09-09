@@ -405,7 +405,7 @@ class HashfileBrowser:
 
             # Final safety check: ensure filename is properly truncated
             visual_name = self.strip_ansi_codes(colored_name)
-            if len(visual_name) > max_filename_display:
+            if self.get_visual_length(visual_name) > max_filename_display:
                 # Emergency truncation if something went wrong
                 safe_name = self.truncate_filename(truncated_name, max_filename_display)
                 colored_name = self.colorize_item(safe_name, is_dir, is_selected, obj)
@@ -739,11 +739,29 @@ class HashfileBrowser:
 
     def get_visual_length(self, text: str) -> int:
         """Get the visual length of text (excluding ANSI codes)."""
-        return len(self.strip_ansi_codes(text))
+        # For now, use a simple approach that handles basic Unicode width
+        # This is more reliable than trying to predict terminal-specific rendering
+        import unicodedata
+
+        # Strip ANSI codes first
+        clean_text = self.strip_ansi_codes(text)
+
+        # Calculate visual width - simple approach
+        visual_width = 0
+        for char in clean_text:
+            # Only handle obviously wide characters
+            east_asian_width = unicodedata.east_asian_width(char)
+            if east_asian_width in ('W', 'F'):  # Wide or Full-width
+                visual_width += 2
+            else:
+                visual_width += 1
+
+        return visual_width
 
     def truncate_filename(self, filename: str, max_length: int) -> str:
         """Truncate filename intelligently if too long."""
-        if len(filename) <= max_length:
+        visual_length = self.get_visual_length(filename)
+        if visual_length <= max_length:
             return filename
 
         # For very constrained space, prioritize showing the end (extension)
@@ -778,22 +796,22 @@ class HashfileBrowser:
         """Calculate optimal layout based on content and terminal width."""
         width, height = self.get_terminal_size()
 
-        # Find the longest filename in current directory
+        # Find the longest filename in current directory (using visual length)
         max_name_len = 0
         for name, size, is_dir, obj in items:
-            visual_name_len = len(name)  # Raw filename length
+            visual_name_len = self.get_visual_length(name)  # Visual length accounting for Unicode
             max_name_len = max(max_name_len, visual_name_len)
 
-        # Calculate positions
+        # Calculate positions with fixed layout (like original)
         marker_space = 2  # ">" + space
-        bar_width = 10 if self.show_size_bars else 0  # "[████████]" + space (reduced to make room)
-        size_width = 15  # Size string width (increased for file counts)
+        bar_width = 10 if self.show_size_bars else 0  # "[████████]" + space (reduced from original 12)
+        size_width = 15  # Size string width (for file counts)
         min_name_width = 15  # Minimum readable filename width
 
         # Calculate available space for filename
         available_for_name = width - marker_space - bar_width - size_width - 2  # -2 for spacing
 
-        # Determine optimal filename width based on content and available space
+        # Use the original approach: let filenames take available space, truncate if needed
         if available_for_name < min_name_width:
             # Not enough space, disable bars if enabled to gain more space
             if self.show_size_bars:
