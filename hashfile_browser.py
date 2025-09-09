@@ -375,13 +375,13 @@ class HashfileBrowser:
 
             # Colorize the truncated name and size
             colored_name = self.colorize_item(truncated_name, is_dir, is_selected, obj)
-            colored_size = self.colorize_size(size_str, obj)
+            colored_size = self.colorize_size(size_str, obj, is_selected)
 
             if self.show_size_bars and max_size > 0:
                 # Include size bar with color
                 size_bar = self.create_size_bar(size, max_size, bar_width=8)
                 ratio = size / max_size if max_size > 0 else 0
-                colored_bar = self.colorize_size_bar(size_bar, ratio, obj)
+                colored_bar = self.colorize_size_bar(size_bar, ratio, obj, is_selected)
 
                 # Use calculated layout positions
                 name_width = layout['name_width']
@@ -409,12 +409,13 @@ class HashfileBrowser:
                 # Emergency truncation if something went wrong
                 safe_name = self.truncate_filename(truncated_name, max_filename_display)
                 colored_name = self.colorize_item(safe_name, is_dir, is_selected, obj)
+                colored_size = self.colorize_size(size_str, obj, is_selected)
 
                 # Rebuild the line with the corrected name
                 if self.show_size_bars and max_size > 0:
                     size_bar = self.create_size_bar(size, max_size, bar_width=8)
                     ratio = size / max_size if max_size > 0 else 0
-                    colored_bar = self.colorize_size_bar(size_bar, ratio, obj)
+                    colored_bar = self.colorize_size_bar(size_bar, ratio, obj, is_selected)
 
                     line_parts = [marker, " ", colored_name]
                     current_pos = 2 + self.get_visual_length(colored_name)
@@ -591,7 +592,7 @@ class HashfileBrowser:
         else:
             return f"{Colors.WHITE}{name}{Colors.RESET}"
 
-    def colorize_size_bar(self, bar: str, ratio: float, obj=None) -> str:
+    def colorize_size_bar(self, bar: str, ratio: float, obj=None, is_selected: bool = False) -> str:
         """Colorize size bar content with neutral brackets."""
         if not bar:  # Empty bar
             return "[]"
@@ -604,18 +605,25 @@ class HashfileBrowser:
             color = Colors.BRIGHT_YELLOW
         else:
             color = self.get_size_bar_color(ratio)
-        # Use neutral color for brackets, colored content for the bar
-        return f"[{color}{bar}{Colors.RESET}]"
 
-    def colorize_size(self, size_str: str, obj=None) -> str:
+        # Don't reset color if item is selected (let reverse video handle it)
+        reset = "" if is_selected else Colors.RESET
+        # Use neutral color for brackets, colored content for the bar
+        return f"[{color}{bar}{reset}]"
+
+    def colorize_size(self, size_str: str, obj=None, is_selected: bool = False) -> str:
         """Colorize file size text."""
         # Check if item is tagged
         is_tagged = obj is not None and obj in self.tagged_items
 
         if is_tagged:
-            return f"{Colors.BRIGHT_YELLOW}{size_str}{Colors.RESET}"
+            # Don't reset if selected (let reverse video handle it)
+            reset = "" if is_selected else Colors.RESET
+            return f"{Colors.BRIGHT_YELLOW}{size_str}{reset}"
         else:
-            return f"{Colors.BRIGHT_CYAN}{size_str}{Colors.RESET}"
+            # Don't reset if selected (let reverse video handle it)
+            reset = "" if is_selected else Colors.RESET
+            return f"{Colors.BRIGHT_CYAN}{size_str}{reset}"
 
     def create_breadcrumbs(self) -> str:
         """Create breadcrumb trail showing path hierarchy."""
