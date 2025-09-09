@@ -66,6 +66,14 @@ class FileEntry:
     size: int
     hash_value: str
 
+    def __hash__(self):
+        return hash((self.path, self.size, self.hash_value))
+
+    def __eq__(self, other):
+        if not isinstance(other, FileEntry):
+            return False
+        return (self.path, self.size, self.hash_value) == (other.path, other.size, other.hash_value)
+
 
 @dataclass
 class DirEntry:
@@ -77,6 +85,14 @@ class DirEntry:
     files: List[FileEntry]
     subdirs: List['DirEntry']
     parent: Optional['DirEntry'] = None
+
+    def __hash__(self):
+        return hash((self.path, self.size, self.file_count))
+
+    def __eq__(self, other):
+        if not isinstance(other, DirEntry):
+            return False
+        return (self.path, self.size, self.file_count) == (other.path, other.size, other.file_count)
 
 
 class HashfileBrowser:
@@ -90,6 +106,8 @@ class HashfileBrowser:
         # Sorting options
         self.sort_by_size = False  # False = sort by name, True = sort by size
         self.show_size_bars = True  # Show/hide size bars
+        # Tagging system
+        self.tagged_items = set()  # Set of tagged FileEntry and DirEntry objects
         
     def load_hashfile(self, filepath: str) -> bool:
         """Load and parse a .hashes file."""
@@ -340,7 +358,7 @@ class HashfileBrowser:
             truncated_name = self.truncate_filename(name, max_filename_display)
 
             # Colorize the truncated name and size
-            colored_name = self.colorize_item(truncated_name, is_dir, is_selected)
+            colored_name = self.colorize_item(truncated_name, is_dir, is_selected, obj)
             colored_size = self.colorize_size(size_str)
 
             if self.show_size_bars and max_size > 0:
@@ -374,7 +392,7 @@ class HashfileBrowser:
             if len(visual_name) > max_filename_display:
                 # Emergency truncation if something went wrong
                 safe_name = self.truncate_filename(truncated_name, max_filename_display)
-                colored_name = self.colorize_item(safe_name, is_dir, is_selected)
+                colored_name = self.colorize_item(safe_name, is_dir, is_selected, obj)
 
                 # Rebuild the line with the corrected name
                 if self.show_size_bars and max_size > 0:
@@ -392,23 +410,39 @@ class HashfileBrowser:
                 else:
                     line = f"{marker} {colored_name:<{name_width}} {colored_size:>10}"
 
-            # Truncate to terminal width (but account for ANSI codes in truncation)
-            visual_line = self.strip_ansi_codes(line)
-            if len(visual_line) > width:
-                # Need to truncate while preserving ANSI codes
-                truncated_visual = visual_line[:width]
-                # Find corresponding position in original string
-                ansi_chars = 0
-                for i, char in enumerate(line):
-                    if i - ansi_chars >= len(truncated_visual):
-                        line = line[:i]
-                        break
-                    if char == '\x1b':  # Start of ANSI sequence
-                        ansi_chars += 1
+            # Apply full-line highlighting for selected items
+            if is_selected:
+                # Pad the line to full terminal width and apply reverse video to entire line
+                visual_line = self.strip_ansi_codes(line)
+                padding_needed = width - len(visual_line)
+                if padding_needed > 0:
+                    line += " " * padding_needed
+                line = f"{Colors.REVERSE}{line}{Colors.RESET}"
+            else:
+                # Truncate to terminal width for non-selected items (but account for ANSI codes in truncation)
+                visual_line = self.strip_ansi_codes(line)
+                if len(visual_line) > width:
+                    # Need to truncate while preserving ANSI codes
+                    truncated_visual = visual_line[:width]
+                    # Find corresponding position in original string
+                    ansi_chars = 0
+                    for i, char in enumerate(line):
+                        if i - ansi_chars >= len(truncated_visual):
+                            line = line[:i]
+                            break
+                        if char == '\x1b':  # Start of ANSI sequence
+                            ansi_chars += 1
             print(line)
         
         # Ultra-compact footer to prevent wrapping
         size_info = f"{Colors.BRIGHT_CYAN}{self.format_size(self.current_dir.size)} ({self.current_dir.file_count}){Colors.RESET}"
+
+        # Add tagged stats if there are tagged items
+        tagged_size, tagged_files = self.get_tagged_stats()
+        if tagged_files > 0:
+            tagged_info = f" | {Colors.BRIGHT_MAGENTA}{self.format_size(tagged_size)} ({tagged_files} tagged){Colors.RESET}"
+            size_info += tagged_info
+
         sort_indicator = "Size" if self.sort_by_size else "Name"
 
         navigation = f"{Colors.BRIGHT_YELLOW}↑↓←→/hjkl{Colors.RESET}"
@@ -417,7 +451,7 @@ class HashfileBrowser:
         sort_mode = "Size" if self.sort_by_size else "Name"
         bars_status = "ON" if self.show_size_bars else "OFF"
 
-        controls = f"{Colors.BRIGHT_RED}s{Colors.RESET}={sort_mode[:1].lower()}, {Colors.BRIGHT_RED}g{Colors.RESET}={bars_status.lower()}, {Colors.BRIGHT_RED}q{Colors.RESET}=quit"
+        controls = f"{Colors.BRIGHT_RED}s{Colors.RESET}={sort_mode[:1].lower()}, {Colors.BRIGHT_RED}g{Colors.RESET}={bars_status.lower()}, {Colors.BRIGHT_RED}t{Colors.RESET}/Space=tag, {Colors.BRIGHT_RED}q{Colors.RESET}=quit"
 
         # Very compact single line
         footer = f"{size_info} [{sort_indicator[:1]}] | {navigation}/{actions} | {controls}"
@@ -514,10 +548,22 @@ class HashfileBrowser:
         else:
             return Colors.BRIGHT_BLACK
 
-    def colorize_item(self, name: str, is_dir: bool, is_selected: bool) -> str:
-        """Colorize item name based on type and selection status."""
+    def colorize_item(self, name: str, is_dir: bool, is_selected: bool, obj: Optional[object] = None) -> str:
+        """Colorize item name based on type, selection status, and tagging."""
+        # Check if item is tagged
+        is_tagged = obj is not None and obj in self.tagged_items
+
         if is_selected:
-            return f"{Colors.REVERSE}{name}{Colors.RESET}"
+            if is_tagged:
+                return f"{Colors.BRIGHT_YELLOW}{name} ✓{Colors.RESET}"
+            else:
+                return f"{name}{Colors.RESET}"
+        elif is_tagged:
+            # Tagged items get special coloring and marking
+            if is_dir:
+                return f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}{name} ✓{Colors.RESET}"
+            else:
+                return f"{Colors.BRIGHT_YELLOW}{name} ✓{Colors.RESET}"
         elif is_dir:
             return f"{Colors.BRIGHT_BLUE}{Colors.BOLD}{name}{Colors.RESET}"
         else:
@@ -766,9 +812,9 @@ class HashfileBrowser:
         items = self.get_current_items()
         if not items or self.selected_index >= len(items):
             return
-        
+
         name, size, is_dir, obj = items[self.selected_index]
-        
+
         if is_dir:
             if obj is None:  # Parent directory
                 if self.current_dir.parent:
@@ -779,6 +825,44 @@ class HashfileBrowser:
                 self.current_dir = obj
                 self.selected_index = 0
                 self.scroll_offset = 0
+
+    def toggle_tag_selected(self) -> None:
+        """Toggle tag status for the selected item and advance to next item."""
+        items = self.get_current_items()
+        if not items or self.selected_index >= len(items):
+            return
+
+        name, size, is_dir, obj = items[self.selected_index]
+
+        # Skip parent directory ("..")
+        if obj is None:
+            return
+
+        # Toggle tag status
+        if obj in self.tagged_items:
+            self.tagged_items.remove(obj)
+        else:
+            self.tagged_items.add(obj)
+
+        # Auto-advance to next item for easier tagging workflow
+        items_count = len(items)
+        if items_count > 0:
+            self.selected_index = (self.selected_index + 1) % items_count
+
+    def get_tagged_stats(self) -> Tuple[int, int]:
+        """Get total size and file count of tagged items."""
+        total_size = 0
+        total_files = 0
+
+        for item in self.tagged_items:
+            if isinstance(item, DirEntry):
+                total_size += item.size
+                total_files += item.file_count
+            elif isinstance(item, FileEntry):
+                total_size += item.size
+                total_files += 1
+
+        return total_size, total_files
     
     def run(self) -> None:
         """Main application loop."""
@@ -812,10 +896,11 @@ class HashfileBrowser:
                 elif key in ['\033[6~', '\033[[6~', '\006', '\x06']:  # Page Down (Ctrl+F)
                     self.navigate_page(1)
                 # Alternative page navigation
-                elif key == ' ':  # Space - Page Down
-                    self.navigate_page(1)
                 elif key == 'b':  # 'b' - Page Up
                     self.navigate_page(-1)
+                # Tagging
+                elif key in ['t', ' ']:  # 't' or Space - Toggle tag
+                    self.toggle_tag_selected()
                 # Sorting and display options
                 elif key == 's':  # Toggle sorting mode
                     self.sort_by_size = not self.sort_by_size
