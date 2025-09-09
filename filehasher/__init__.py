@@ -487,10 +487,10 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
         print(f"DEBUG: Found {total_files} total files to process")
 
     # Determine number of workers (always use parallel, default to 1 worker if not specified)
-        if workers is None:
-            workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
-        else:
-            workers = min(workers, total_files) if total_files > 0 else 1
+    if workers is None:
+        workers = min(mp.cpu_count(), total_files) if total_files > 0 else 1
+    else:
+        workers = min(workers, total_files) if total_files > 0 else 1
 
     # Start the writer thread for parallel processing
     writer_thread = WriterThread(hash_file, update, append, algorithm, write_frequency)
@@ -614,15 +614,9 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                                 if advance_amount > 0:
                                                     progress.update(worker_tasks[worker_id], advance=advance_amount, filename=message[1])
                                                     # Force refresh for progress updates
-                                                    progress.refresh()
+                                                    #progress.refresh()
                                                     # Force console flush to ensure immediate display
-                                                    console.file.flush()
-
-                                                    # Print simple progress to stdout for immediate visibility
-                                                    total = progress.tasks[worker_tasks[worker_id]].total
-                                                    current = progress.tasks[worker_tasks[worker_id]].completed
-                                                    if current > 0 and current < total:  # Only show intermediate progress
-                                                        print(f"\rWorker {worker_id+1}: {current}/{total} files processed", end="", flush=True)
+                                                    #console.file.flush()
                                         elif message[0] == 'verbose':
                                             # Verbose message from worker - show in progress bar description
                                             progress.update(worker_tasks[worker_id], description=f"Worker {worker_id+1}: {message[1]}")
@@ -633,7 +627,7 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                                         pass
 
                                 # Small delay to prevent busy waiting
-                                time.sleep(0.001)
+                                time.sleep(0.01)
                         except Exception as e:
                             # Ignore errors during cleanup
                             pass
@@ -672,8 +666,8 @@ def generate_hashes(hash_file: str, update: bool = False, append: bool = False,
                     # Wait for writer queue to be empty to ensure all results are processed
                     if verbose:
                         print("Waiting for writer queue to empty...")
+                    import time
                     while not writer_queue.empty():
-                        import time
                         time.sleep(0.1)
                     if verbose:
                         print("Writer queue is empty, all results processed.")
