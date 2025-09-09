@@ -273,7 +273,25 @@ class HashfileBrowser:
         breadcrumbs = self.create_breadcrumbs()
         header = f"{Colors.BRIGHT_WHITE}{Colors.BOLD}📁 {breadcrumbs}{Colors.RESET}"
 
-        print(header[:width])
+        # Additional safeguard: ensure no double slashes in the final header
+        visual_header = self.strip_ansi_codes(header)
+        if "//" in visual_header:
+            # Fix any double slashes that might have slipped through
+            fixed_visual = visual_header.replace("//", "/")
+            # Reconstruct header with proper ANSI codes
+            # This is a fallback fix for any edge cases
+            if visual_header.startswith("📁 //"):
+                header = f"{Colors.BRIGHT_WHITE}{Colors.BOLD}📁 {Colors.CYAN}/{Colors.RESET}{Colors.BRIGHT_WHITE}{Colors.BOLD}{fixed_visual[4:]}{Colors.RESET}"
+
+        # Fallback: if breadcrumbs are too short (indicating a problem), show basic path
+        visual_breadcrumbs = self.strip_ansi_codes(breadcrumbs)
+        if len(visual_breadcrumbs) <= 1 and self.current_dir and self.current_dir.name:
+            # Try to construct a basic path representation
+            if self.current_dir.name != "(Hash File Root)":
+                fallback_breadcrumbs = f"/{self.current_dir.name}"
+                header = f"{Colors.BRIGHT_WHITE}{Colors.BOLD}📁 {Colors.BRIGHT_WHITE}{Colors.BOLD}{fallback_breadcrumbs}{Colors.RESET}{Colors.RESET}"
+
+        print(header)
         print("-" * min(width, 80))
 
         # Get items to display (now using the centralized method)
@@ -528,7 +546,7 @@ class HashfileBrowser:
             if current.name and current.name != "(Hash File Root)":  # Skip technical names
                 components.insert(0, current.name)
             elif not current.parent:  # This is the root
-                components.insert(0, "/")
+                components.insert(0, "")
             current = current.parent
 
         # Remove any empty components and clean up
@@ -546,7 +564,71 @@ class HashfileBrowser:
             else:  # Parent directories
                 breadcrumb_parts.append(f"{Colors.CYAN}{component}{Colors.RESET}")
 
-        return "/".join(breadcrumb_parts)
+        full_path = "/".join(breadcrumb_parts)
+        # Clean up the path to ensure proper formatting
+        full_path = full_path.replace("//", "/")  # Remove double slashes
+        if full_path and not full_path.startswith("/"):
+            full_path = "/" + full_path  # Ensure absolute path
+
+        # Check if we need to truncate for terminal width
+        width, _ = self.get_terminal_size()
+        # Reserve space for "📁 " prefix and potential ANSI codes
+        # "📁 " is about 4 chars, plus ANSI codes add overhead
+        available_space = width - 6  # Conservative estimate for emoji + space + ANSI
+
+        # Get the visual length (excluding ANSI codes)
+        visual_length = len(self.strip_ansi_codes(full_path))
+
+        if visual_length <= available_space:
+            return full_path
+
+        # Need to truncate - use a simpler, more predictable approach
+        current_dir = breadcrumb_parts[-1]
+        current_visual = len(self.strip_ansi_codes(current_dir))
+
+        # Reserve space for ellipsis
+        ellipsis_space = 3  # "..."
+
+        # If current directory alone is too long, truncate it
+        if current_visual >= available_space - ellipsis_space:
+            truncated_current = self.strip_ansi_codes(current_dir)
+            max_current_len = available_space - ellipsis_space
+            if max_current_len > 0:
+                truncated_current = "..." + truncated_current[-max_current_len:]
+            else:
+                truncated_current = "..."
+
+            # Reapply color to truncated current dir
+            if Colors.BRIGHT_WHITE in current_dir and Colors.BOLD in current_dir:
+                return f"{Colors.BRIGHT_WHITE}{Colors.BOLD}{truncated_current}{Colors.RESET}"
+            else:
+                return truncated_current
+
+        # Build truncated path by working backwards from current directory
+        result_parts = [current_dir]
+        remaining_space = available_space - current_visual
+
+        # Add parent directories, starting with the closest ones
+        added_ellipsis = False
+        for i in range(len(breadcrumb_parts) - 2, -1, -1):
+            parent_dir = breadcrumb_parts[i]
+            parent_visual = len(self.strip_ansi_codes(parent_dir))
+            separator_space = 1  # for "/"
+
+            if not added_ellipsis and parent_visual + separator_space <= remaining_space:
+                result_parts.insert(0, parent_dir)
+                remaining_space -= parent_visual + separator_space
+            elif not added_ellipsis:
+                # Add ellipsis and stop adding more directories
+                if remaining_space >= ellipsis_space + separator_space:
+                    result_parts.insert(0, f"{Colors.DIM}...{Colors.RESET}")
+                    added_ellipsis = True
+                break
+            else:
+                break
+
+        final_path = "/".join(result_parts)
+        return final_path
 
     def colorize_header(self, header: str) -> str:
         """Colorize header text."""
