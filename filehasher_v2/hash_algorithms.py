@@ -57,6 +57,15 @@ def get_algorithm(name: str) -> HashAlgorithm:
     return ALGORITHMS[name.lower()]
 
 
+def get_algorithm_key(algorithm: HashAlgorithm) -> str:
+    """Get the algorithm key for a HashAlgorithm instance"""
+    for key, algo in ALGORITHMS.items():
+        if algo is algorithm:
+            return key
+    # Fallback: convert display name to key format
+    return algorithm.name.lower().replace('-', '')
+
+
 def benchmark_algorithms(test_file: Path, algorithms: List[str] = None) -> Dict[str, float]:
     """
     Benchmark different hash algorithms on a test file
