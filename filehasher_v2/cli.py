@@ -162,6 +162,9 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
         # Print summary
         processor.print_summary(results)
         
+        # Print timing statistics
+        processor.print_timing_statistics(results)
+        
         action = "updated" if update else "created"
         console.print(f"[bold green]Hash file {action}:[/bold green] {output}")
         
