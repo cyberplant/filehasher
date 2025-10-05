@@ -16,14 +16,23 @@ class HashAlgorithm:
         self.name = name
         self.hasher_factory = hasher_factory
     
-    def hash_file(self, file_path: Path, chunk_size: int = 65536) -> str:
+    def hash_file(self, file_path: Path, chunk_size: int = 1024*1024, progress_callback=None) -> str:
         """Hash a file in chunks to avoid memory issues"""
         hasher = self.hasher_factory()
         
         try:
+            file_size = file_path.stat().st_size
+            bytes_processed = 0
+            
             with open(file_path, 'rb') as f:
                 while chunk := f.read(chunk_size):
                     hasher.update(chunk)
+                    bytes_processed += len(chunk)
+                    
+                    # Call progress callback if provided
+                    if progress_callback:
+                        progress_callback(bytes_processed, file_size)
+            
             return hasher.hexdigest()
         except (IOError, OSError) as e:
             raise HashError(f"Failed to hash {file_path}: {e}")

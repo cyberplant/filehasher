@@ -4,6 +4,8 @@ Command line interface for filehasher
 
 import multiprocessing
 import sys
+import signal
+import time
 from pathlib import Path
 from typing import Optional
 

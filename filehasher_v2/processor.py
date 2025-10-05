@@ -7,6 +7,8 @@ from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import time
+import signal
+import threading
 
 from rich.console import Console
 from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -32,12 +34,31 @@ def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: 
     """Worker function to process a single file"""
     from .hash_algorithms import get_algorithm
     
+    def progress_callback(bytes_processed, file_size):
+        """Progress callback for file hashing"""
+        progress_queue.put({
+            'thread_id': thread_id,
+            'filename': file_info.relative_path.name,
+            'size': file_info.size,
+            'file_progress': bytes_processed,
+            'file_total': file_size,
+            'type': 'file_progress'
+        })
+    
     try:
+        # Send start notification
+        progress_queue.put({
+            'thread_id': thread_id,
+            'filename': file_info.relative_path.name,
+            'size': file_info.size,
+            'type': 'file_start'
+        })
+        
         # Get algorithm in worker process
         algorithm = get_algorithm(algorithm_name)
         
-        # Hash the file
-        file_hash = algorithm.hash_file(file_info.path)
+        # Hash the file with progress callback
+        file_hash = algorithm.hash_file(file_info.path, progress_callback=progress_callback)
         
         # For now, use a simple secondary hash (file size + mtime)
         # This could be enhanced with a different algorithm
@@ -47,25 +68,27 @@ def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: 
         result = ProcessingResult(file_info, file_hash, other_hash)
         result_queue.put(result)
         
-        # Send progress update with thread ID
+        # Send completion notification
         progress_queue.put({
             'thread_id': thread_id,
             'filename': file_info.relative_path.name,
             'size': file_info.size,
-            'success': True
+            'success': True,
+            'type': 'file_complete'
         })
         
     except HashError as e:
         result = ProcessingResult(file_info, error=str(e))
         result_queue.put(result)
         
-        # Send progress update with thread ID
+        # Send error notification
         progress_queue.put({
             'thread_id': thread_id,
             'filename': file_info.relative_path.name,
             'size': file_info.size,
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'type': 'file_complete'
         })
 
 
@@ -76,6 +99,7 @@ class FileProcessor:
         self.algorithm = algorithm
         self.num_processes = num_processes
         self.show_progress = show_progress
+        self.should_stop = False
         # Don't create console here - create it when needed to avoid pickle issues
     
     def process_files(self, file_batches: List[List[FileInfo]]) -> List[ProcessingResult]:
@@ -109,19 +133,24 @@ class FileProcessor:
                 
                 for file_info in files:
                     try:
-                        file_hash = self.algorithm.hash_file(file_info.path)
+                        # Create progress callback for single-threaded mode
+                        def progress_callback(bytes_processed, file_size):
+                            progress_percent = (bytes_processed / file_size) * 100
+                            progress.update(task, description=f"Processing {file_info.relative_path.name} ({progress_percent:.1f}%)")
+                        
+                        file_hash = self.algorithm.hash_file(file_info.path, progress_callback=progress_callback)
                         secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
                         other_hash = self.algorithm.hash_data(secondary_data)
                         
                         result = ProcessingResult(file_info, file_hash, other_hash)
                         results.append(result)
                         
-                        progress.update(task, advance=1, description=f"Processing {file_info.relative_path.name}")
+                        progress.update(task, advance=1, description=f"✓ {file_info.relative_path.name}")
                         
                     except HashError as e:
                         result = ProcessingResult(file_info, error=str(e))
                         results.append(result)
-                        progress.update(task, advance=1, description=f"Error: {file_info.relative_path.name}")
+                        progress.update(task, advance=1, description=f"✗ Error: {file_info.relative_path.name}")
         else:
             # No progress reporting
             for file_info in files:
@@ -146,14 +175,14 @@ class FileProcessor:
         processes = []
         
         # Start worker processes
-        for batch in file_batches:
+        for thread_id, batch in enumerate(file_batches):
             if not batch:  # Skip empty batches
                 continue
                 
             from .hash_algorithms import get_algorithm_key
             process = Process(
                 target=self._process_batch_worker,
-                args=(batch, get_algorithm_key(self.algorithm), result_queue, progress_queue, len(processes))
+                args=(batch, get_algorithm_key(self.algorithm), result_queue, progress_queue, thread_id)
             )
             process.start()
             processes.append(process)
@@ -186,34 +215,63 @@ class FileProcessor:
                 
                 # Track completed files per thread
                 completed_per_thread = [0] * len(tasks)
-                total_completed = 0
+                current_files = [""] * len(tasks)  # Track current file being processed
+                file_progress = [0.0] * len(tasks)  # Track file-level progress
+                
+                # Set up signal handler for CTRL-C
+                def signal_handler(signum, frame):
+                    self.should_stop = True
+                    console.print("\n[yellow]Received interrupt signal. Stopping gracefully...[/yellow]")
+                
+                signal.signal(signal.SIGINT, signal_handler)
                 
                 # Collect results and update progress
-                while total_completed < total_files:
+                last_write_time = time.time()
+                write_interval = 5.0  # Write hashes every 5 seconds
+                
+                while not self.should_stop:
                     # Check for progress updates
                     try:
                         while True:
                             update = progress_queue.get_nowait()
-                            total_completed += 1
                             
                             # Get thread ID from the update
                             thread_id = update.get('thread_id', 0)
                             
-                            # Find the corresponding task
                             if thread_id < len(tasks):
                                 task_id, _ = tasks[thread_id]
-                                completed_per_thread[thread_id] += 1
-                                
-                                status = "✓" if update['success'] else "✗"
                                 filename = update['filename']
-                                if len(filename) > 30:
-                                    filename = filename[:27] + "..."
+                                if len(filename) > 25:
+                                    filename = filename[:22] + "..."
                                 
-                                progress.update(
-                                    task_id, 
-                                    advance=1, 
-                                    description=f"Thread {thread_id+1}: {status} {filename}"
-                                )
+                                update_type = update.get('type', 'file_complete')
+                                
+                                if update_type == 'file_start':
+                                    current_files[thread_id] = filename
+                                    file_progress[thread_id] = 0.0
+                                    progress.update(
+                                        task_id, 
+                                        description=f"Thread {thread_id+1}: {filename}"
+                                    )
+                                elif update_type == 'file_progress':
+                                    file_total = update.get('file_total', 1)
+                                    file_progress_bytes = update.get('file_progress', 0)
+                                    file_progress[thread_id] = (file_progress_bytes / file_total) * 100
+                                    
+                                    progress.update(
+                                        task_id, 
+                                        description=f"Thread {thread_id+1}: {filename} ({file_progress[thread_id]:.1f}%)"
+                                    )
+                                elif update_type == 'file_complete':
+                                    completed_per_thread[thread_id] += 1
+                                    status = "✓" if update.get('success', True) else "✗"
+                                    current_files[thread_id] = ""
+                                    
+                                    progress.update(
+                                        task_id, 
+                                        advance=1, 
+                                        description=f"Thread {thread_id+1}: {status} {filename}"
+                                    )
                     except:
                         pass
                     
@@ -223,6 +281,20 @@ class FileProcessor:
                         results.append(result)
                     except:
                         pass
+                    
+                    # Check if all files are completed
+                    total_completed = sum(completed_per_thread)
+                    if total_completed >= total_files:
+                        break
+                    
+                    # Periodic hash writing
+                    current_time = time.time()
+                    if current_time - last_write_time > write_interval:
+                        # Trigger periodic write (this will be handled by the caller)
+                        last_write_time = current_time
+                    
+                    # Small delay to prevent busy waiting
+                    time.sleep(0.01)
                 
                 # Collect any remaining results
                 while not result_queue.empty():
@@ -231,6 +303,16 @@ class FileProcessor:
                         results.append(result)
                     except:
                         break
+                
+                # Clean up processes if stopped early
+                if self.should_stop:
+                    console.print("[yellow]Stopping worker processes...[/yellow]")
+                    for process in processes:
+                        if process.is_alive():
+                            process.terminate()
+                            process.join(timeout=2)
+                            if process.is_alive():
+                                process.kill()
         else:
             # No progress reporting - just collect results
             for process in processes:
@@ -245,7 +327,8 @@ class FileProcessor:
         
         # Wait for all processes to complete
         for process in processes:
-            process.join()
+            if process.is_alive():
+                process.join()
         
         return results
     
