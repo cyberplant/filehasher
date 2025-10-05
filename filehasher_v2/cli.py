@@ -37,8 +37,9 @@ def cli():
               help='Number of processes to use (default: 1, use "auto" for CPU count)')
 @click.option('--quiet', '-q', is_flag=True, help='Suppress progress output')
 @click.option('--follow-symlinks', is_flag=True, help='Follow symbolic links')
+@click.option('--update', '-u', is_flag=True, help='Update existing hash file, only hash changed files')
 def generate(directory: Path, algorithm: str, output: Optional[Path], 
-             processes: str, quiet: bool, follow_symlinks: bool):
+             processes: str, quiet: bool, follow_symlinks: bool, update: bool):
     """Generate hash file for a directory"""
     
     # Parse processes option
@@ -66,30 +67,64 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
     console.print(f"[bold blue]Algorithm:[/bold blue] {hash_algorithm.name}")
     console.print(f"[bold blue]Output:[/bold blue] {output}")
     console.print(f"[bold blue]Processes:[/bold blue] {num_processes}")
+    if update:
+        console.print(f"[bold blue]Mode:[/bold blue] Update existing hash file")
     
     # Scan directory
     scanner = FileScanner(directory, follow_symlinks=follow_symlinks)
     
     try:
         files = scanner.scan_directory()
-        console.print(f"[bold green]Found {len(files)} files to process[/bold green]")
         
-        if not files:
+        # Handle update mode
+        files_to_process = files
+        if update and Path(output).exists():
+            # Load existing hash file
+            existing_hash_file = HashFile(Path(output))
+            existing_hash_file.read_entries()
+            
+            # Filter files that need updating
+            files_to_process = [f for f in files if existing_hash_file.needs_update(f)]
+            
+            if not files_to_process:
+                console.print("[green]No files need updating![/green]")
+                return
+            
+            console.print(f"[bold green]Found {len(files)} total files, {len(files_to_process)} need updating[/bold green]")
+        else:
+            console.print(f"[bold green]Found {len(files)} files to process[/bold green]")
+        
+        if not files_to_process:
             console.print("[yellow]No files found to process[/yellow]")
             return
         
         # Load balance files across processes
-        file_batches = scanner.load_balance_files(files, num_processes)
+        file_batches = scanner.load_balance_files(files_to_process, num_processes)
         
         # Process files
         processor = FileProcessor(hash_algorithm, num_processes, show_progress=not quiet)
         results = processor.process_files(file_batches)
         
-        # Create hash file
-        hash_file = HashFile(output)
-        hash_file.write_header(hash_algorithm, directory)
+        # Create or update hash file
+        hash_file = HashFile(Path(output))
         
-        # Add entries
+        if update and Path(output).exists():
+            # Update mode: load existing entries and update/add new ones
+            hash_file.read_entries()
+            
+            # Preserve metadata from existing file
+            if not hash_file.metadata:
+                hash_file.write_metadata_header(directory)
+            
+            # Remove old entries for files we're updating
+            updated_paths = {r.file_info.relative_path for r in results}
+            hash_file.entries = [e for e in hash_file.entries 
+                               if Path(e.directory) / e.filename not in updated_paths]
+        else:
+            # New file: write header
+            hash_file.write_header(directory)
+        
+        # Add new/updated entries
         for result in results:
             if result.success:
                 entry = HashEntry(
@@ -102,7 +137,7 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
                     mtime=result.file_info.mtime,
                     is_symlink=result.file_info.is_symlink
                 )
-                hash_file.add_entry(entry)
+                hash_file.add_entry(entry, algorithm, write_to_file=not update)
             else:
                 # Add symlinks as commented entries
                 if result.file_info.is_symlink:
@@ -116,12 +151,17 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
                         mtime=result.file_info.mtime,
                         is_symlink=True
                     )
-                    hash_file.add_entry(entry)
+                    hash_file.add_entry(entry, write_to_file=not update)
+        
+        # Rewrite the entire file in update mode
+        if update and Path(output).exists():
+            hash_file.write_all_entries(algorithm)
         
         # Print summary
         processor.print_summary(results)
         
-        console.print(f"[bold green]Hash file created:[/bold green] {output}")
+        action = "updated" if update else "created"
+        console.print(f"[bold green]Hash file {action}:[/bold green] {output}")
         
     except Exception as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
@@ -140,7 +180,7 @@ def duplicates(hash_file: Path, output: Path):
     
     try:
         # Read hash file
-        file_hash = HashFile(hash_file)
+        file_hash = HashFile(Path(hash_file))
         entries = file_hash.read_entries()
         
         if not entries:
@@ -198,8 +238,8 @@ def compare(hash_file1: Path, hash_file2: Path, output: Path):
     
     try:
         # Read hash files
-        file1 = HashFile(hash_file1)
-        file2 = HashFile(hash_file2)
+        file1 = HashFile(Path(hash_file1))
+        file2 = HashFile(Path(hash_file2))
         
         entries1 = file1.read_entries()
         entries2 = file2.read_entries()
