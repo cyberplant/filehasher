@@ -1,0 +1,257 @@
+"""
+Multiprocessing file hashing with progress reporting
+"""
+
+import multiprocessing as mp
+from multiprocessing import Process, Queue
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import time
+
+from rich.console import Console
+from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.live import Live
+from rich.table import Table
+
+from .file_scanner import FileInfo
+from .hash_algorithms import HashAlgorithm, HashError
+from .hash_file import HashEntry
+
+
+class ProcessingResult:
+    """Result of file processing"""
+    def __init__(self, file_info: FileInfo, file_hash: str = None, other_hash: str = None, error: str = None):
+        self.file_info = file_info
+        self.file_hash = file_hash
+        self.other_hash = other_hash
+        self.error = error
+        self.success = error is None
+
+
+def process_file_worker(file_info: FileInfo, algorithm: HashAlgorithm, result_queue: Queue, progress_queue: Queue):
+    """Worker function to process a single file"""
+    try:
+        # Hash the file
+        file_hash = algorithm.hash_file(file_info.path)
+        
+        # For now, use a simple secondary hash (file size + mtime)
+        # This could be enhanced with a different algorithm
+        secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
+        other_hash = algorithm.hash_data(secondary_data)
+        
+        result = ProcessingResult(file_info, file_hash, other_hash)
+        result_queue.put(result)
+        
+        # Send progress update
+        progress_queue.put({
+            'filename': file_info.filename,
+            'size': file_info.size,
+            'success': True
+        })
+        
+    except HashError as e:
+        result = ProcessingResult(file_info, error=str(e))
+        result_queue.put(result)
+        
+        # Send progress update
+        progress_queue.put({
+            'filename': file_info.filename,
+            'size': file_info.size,
+            'success': False,
+            'error': str(e)
+        })
+
+
+class FileProcessor:
+    """Handles multiprocessing file hashing with progress reporting"""
+    
+    def __init__(self, algorithm: HashAlgorithm, num_processes: int = 1, show_progress: bool = True):
+        self.algorithm = algorithm
+        self.num_processes = num_processes
+        self.show_progress = show_progress
+        self.console = Console()
+    
+    def process_files(self, file_batches: List[List[FileInfo]]) -> List[ProcessingResult]:
+        """Process files using multiprocessing with progress reporting"""
+        if not file_batches:
+            return []
+        
+        if self.num_processes == 1:
+            # Single process mode
+            return self._process_files_single(file_batches[0])
+        
+        # Multiprocessing mode
+        return self._process_files_multiprocess(file_batches)
+    
+    def _process_files_single(self, files: List[FileInfo]) -> List[ProcessingResult]:
+        """Process files in single process mode"""
+        results = []
+        
+        if self.show_progress:
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                "({task.completed}/{task.total})",
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=self.console
+            ) as progress:
+                task = progress.add_task("Processing files", total=len(files))
+                
+                for file_info in files:
+                    try:
+                        file_hash = self.algorithm.hash_file(file_info.path)
+                        secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
+                        other_hash = self.algorithm.hash_data(secondary_data)
+                        
+                        result = ProcessingResult(file_info, file_hash, other_hash)
+                        results.append(result)
+                        
+                        progress.update(task, advance=1, description=f"Processing {file_info.filename}")
+                        
+                    except HashError as e:
+                        result = ProcessingResult(file_info, error=str(e))
+                        results.append(result)
+                        progress.update(task, advance=1, description=f"Error: {file_info.filename}")
+        else:
+            # No progress reporting
+            for file_info in files:
+                try:
+                    file_hash = self.algorithm.hash_file(file_info.path)
+                    secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
+                    other_hash = self.algorithm.hash_data(secondary_data)
+                    
+                    result = ProcessingResult(file_info, file_hash, other_hash)
+                    results.append(result)
+                    
+                except HashError as e:
+                    result = ProcessingResult(file_info, error=str(e))
+                    results.append(result)
+        
+        return results
+    
+    def _process_files_multiprocess(self, file_batches: List[List[FileInfo]]) -> List[ProcessingResult]:
+        """Process files using multiple processes"""
+        result_queue = mp.Queue()
+        progress_queue = mp.Queue()
+        processes = []
+        
+        # Start worker processes
+        for batch in file_batches:
+            if not batch:  # Skip empty batches
+                continue
+                
+            process = Process(
+                target=self._process_batch_worker,
+                args=(batch, self.algorithm, result_queue, progress_queue)
+            )
+            process.start()
+            processes.append(process)
+        
+        results = []
+        
+        if self.show_progress:
+            # Collect all files for progress tracking
+            total_files = sum(len(batch) for batch in file_batches)
+            
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                "({task.completed}/{task.total})",
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=self.console
+            ) as progress:
+                task = progress.add_task("Processing files", total=total_files)
+                
+                # Collect results and update progress
+                completed = 0
+                while completed < total_files:
+                    # Check for progress updates
+                    try:
+                        while True:
+                            update = progress_queue.get_nowait()
+                            completed += 1
+                            status = "✓" if update['success'] else "✗"
+                            filename = update['filename']
+                            if len(filename) > 40:
+                                filename = filename[:37] + "..."
+                            
+                            progress.update(task, advance=1, description=f"{status} {filename}")
+                    except:
+                        pass
+                    
+                    # Check for results
+                    try:
+                        result = result_queue.get(timeout=0.1)
+                        results.append(result)
+                    except:
+                        pass
+                
+                # Collect any remaining results
+                while not result_queue.empty():
+                    try:
+                        result = result_queue.get_nowait()
+                        results.append(result)
+                    except:
+                        break
+        else:
+            # No progress reporting - just collect results
+            for process in processes:
+                process.join()
+            
+            while not result_queue.empty():
+                try:
+                    result = result_queue.get_nowait()
+                    results.append(result)
+                except:
+                    break
+        
+        # Wait for all processes to complete
+        for process in processes:
+            process.join()
+        
+        return results
+    
+    def _process_batch_worker(self, files: List[FileInfo], algorithm: HashAlgorithm, result_queue: Queue, progress_queue: Queue):
+        """Worker function to process a batch of files"""
+        for file_info in files:
+            process_file_worker(file_info, algorithm, result_queue, progress_queue)
+    
+    def get_summary_stats(self, results: List[ProcessingResult]) -> Dict[str, Any]:
+        """Get summary statistics from processing results"""
+        total_files = len(results)
+        successful = sum(1 for r in results if r.success)
+        failed = total_files - successful
+        
+        total_size = sum(r.file_info.size for r in results if r.success)
+        
+        return {
+            'total_files': total_files,
+            'successful': successful,
+            'failed': failed,
+            'total_size': total_size,
+            'errors': [r.error for r in results if not r.success]
+        }
+    
+    def print_summary(self, results: List[ProcessingResult]):
+        """Print processing summary"""
+        stats = self.get_summary_stats(results)
+        
+        table = Table(title="Processing Summary")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        
+        table.add_row("Total files", str(stats['total_files']))
+        table.add_row("Successful", str(stats['successful']))
+        table.add_row("Failed", str(stats['failed']))
+        table.add_row("Total size", f"{stats['total_size']:,} bytes")
+        
+        self.console.print(table)
+        
+        if stats['errors']:
+            self.console.print("\n[bold red]Errors encountered:[/bold red]")
+            for error in stats['errors']:
+                self.console.print(f"  • {error}")
