@@ -28,7 +28,7 @@ class ProcessingResult:
         self.success = error is None
 
 
-def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: Queue, progress_queue: Queue):
+def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: Queue, progress_queue: Queue, thread_id: int = 0):
     """Worker function to process a single file"""
     from .hash_algorithms import get_algorithm
     
@@ -47,8 +47,9 @@ def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: 
         result = ProcessingResult(file_info, file_hash, other_hash)
         result_queue.put(result)
         
-        # Send progress update
+        # Send progress update with thread ID
         progress_queue.put({
+            'thread_id': thread_id,
             'filename': file_info.relative_path.name,
             'size': file_info.size,
             'success': True
@@ -58,8 +59,9 @@ def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: 
         result = ProcessingResult(file_info, error=str(e))
         result_queue.put(result)
         
-        # Send progress update
+        # Send progress update with thread ID
         progress_queue.put({
+            'thread_id': thread_id,
             'filename': file_info.relative_path.name,
             'size': file_info.size,
             'success': False,
@@ -151,7 +153,7 @@ class FileProcessor:
             from .hash_algorithms import get_algorithm_key
             process = Process(
                 target=self._process_batch_worker,
-                args=(batch, get_algorithm_key(self.algorithm), result_queue, progress_queue)
+                args=(batch, get_algorithm_key(self.algorithm), result_queue, progress_queue, len(processes))
             )
             process.start()
             processes.append(process)
@@ -172,22 +174,46 @@ class FileProcessor:
                 TimeRemainingColumn(),
                 console=console
             ) as progress:
-                task = progress.add_task("Processing files", total=total_files)
+                # Create individual progress bars for each batch/thread
+                tasks = []
+                for i, batch in enumerate(file_batches):
+                    if batch:  # Only create task for non-empty batches
+                        task_id = progress.add_task(
+                            f"Thread {i+1}: Processing files", 
+                            total=len(batch)
+                        )
+                        tasks.append((task_id, len(batch)))
+                
+                # Track completed files per thread
+                completed_per_thread = [0] * len(tasks)
+                total_completed = 0
                 
                 # Collect results and update progress
-                completed = 0
-                while completed < total_files:
+                while total_completed < total_files:
                     # Check for progress updates
                     try:
                         while True:
                             update = progress_queue.get_nowait()
-                            completed += 1
-                            status = "✓" if update['success'] else "✗"
-                            filename = update['filename']
-                            if len(filename) > 40:
-                                filename = filename[:37] + "..."
+                            total_completed += 1
                             
-                            progress.update(task, advance=1, description=f"{status} {filename}")
+                            # Get thread ID from the update
+                            thread_id = update.get('thread_id', 0)
+                            
+                            # Find the corresponding task
+                            if thread_id < len(tasks):
+                                task_id, _ = tasks[thread_id]
+                                completed_per_thread[thread_id] += 1
+                                
+                                status = "✓" if update['success'] else "✗"
+                                filename = update['filename']
+                                if len(filename) > 30:
+                                    filename = filename[:27] + "..."
+                                
+                                progress.update(
+                                    task_id, 
+                                    advance=1, 
+                                    description=f"Thread {thread_id+1}: {status} {filename}"
+                                )
                     except:
                         pass
                     
@@ -223,10 +249,10 @@ class FileProcessor:
         
         return results
     
-    def _process_batch_worker(self, files: List[FileInfo], algorithm_name: str, result_queue: Queue, progress_queue: Queue):
+    def _process_batch_worker(self, files: List[FileInfo], algorithm_name: str, result_queue: Queue, progress_queue: Queue, thread_id: int = 0):
         """Worker function to process a batch of files"""
         for file_info in files:
-            process_file_worker(file_info, algorithm_name, result_queue, progress_queue)
+            process_file_worker(file_info, algorithm_name, result_queue, progress_queue, thread_id)
     
     def get_summary_stats(self, results: List[ProcessingResult]) -> Dict[str, Any]:
         """Get summary statistics from processing results"""
