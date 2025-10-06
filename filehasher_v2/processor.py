@@ -233,16 +233,23 @@ class MultiprocessHashProcessor:
         
         # Collect results and show simple progress
         total_files = sum(len(files) for files in file_lists)
+        total_workers = len(self.workers)
         last_update = time.time()
         
         if not self.quiet:
-            self.console.print(f"[blue]Processing {total_files} files with {len(self.workers)} workers...[/blue]")
+            self.console.print(f"[blue]Processing {total_files} files with {total_workers} workers...[/blue]")
         
-        # Collect results with timeout
+        # Calculate adaptive timeout based on file sizes and workers
+        total_bytes = sum(sum(f.size for f in files) for files in file_lists)
+        # Estimate: 100MB/s per worker, with minimum 10s timeout
+        estimated_time = max(10.0, total_bytes / (100 * 1024 * 1024 * total_workers))
+        # Cap at 5 minutes
+        adaptive_timeout = min(estimated_time, 300.0)
+        
+        # Collect results with adaptive timeout
         timeout_start = time.time()
-        timeout_duration = 300  # 5 minutes timeout
+        timeout_duration = 300  # 5 minutes maximum timeout
         completed_workers = 0
-        total_workers = len(self.workers)
         
         while completed_workers < total_workers and not self.stop_event.is_set():
             if time.time() - timeout_start > timeout_duration:
@@ -250,7 +257,7 @@ class MultiprocessHashProcessor:
                 break
                 
             try:
-                result = self.results_queue.get(timeout=2.0)
+                result = self.results_queue.get(timeout=adaptive_timeout)
                 if isinstance(result, HashResult):
                     self.results.append(result)
                     # Show progress every few seconds
@@ -264,12 +271,13 @@ class MultiprocessHashProcessor:
                         if not self.quiet:
                             self.console.print(f"[blue]Worker {result['stats'].worker_id} completed: {result['stats'].files_processed} files, {result['stats'].bytes_processed} bytes[/blue]")
             except Exception as e:
-                if not self.quiet:
-                    self.console.print(f"[yellow]Timeout or error in result collection: {e}[/yellow]")
                 # Check if workers are still alive
                 alive_workers = [w for w in self.workers if w.is_alive()]
                 if not alive_workers:
                     break
+                # Only show timeout message if it's not just a normal timeout
+                if not self.quiet and "Empty" not in str(e):
+                    self.console.print(f"[yellow]Timeout waiting for results (workers still processing)...[/yellow]")
                 continue
         
         # Force cleanup of workers
