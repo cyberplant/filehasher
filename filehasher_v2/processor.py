@@ -10,6 +10,7 @@ import time
 import signal
 import logging
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -171,6 +172,54 @@ def worker_process(worker_id: int, files: List[FileInfo], algorithm: HashAlgorit
     })
 
 
+def process_files_batch(files: List[FileInfo], algorithm: HashAlgorithm) -> List[HashResult]:
+    """
+    Process a batch of files using a single worker process.
+    This function is designed to be called by ProcessPoolExecutor.
+    
+    Args:
+        files: List of FileInfo objects to process
+        algorithm: Hash algorithm to use
+    
+    Returns:
+        List of HashResult objects
+    """
+    results = []
+    processor = HashProcessor(algorithm)
+    
+    for file_info in files:
+        try:
+            start_time = time.time()
+            primary_hash = processor.compute_file_hash(file_info.path)
+            secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
+            secondary_hash = processor.compute_data_hash(secondary_data)
+            
+            result = HashResult(
+                file_info=file_info,
+                primary_hash=primary_hash,
+                secondary_hash=secondary_hash,
+                processing_time=time.time() - start_time,
+                bytes_processed=file_info.size,
+                success=True
+            )
+            results.append(result)
+            
+        except Exception as e:
+            result = HashResult(
+                file_info=file_info,
+                primary_hash="",
+                secondary_hash="",
+                processing_time=time.time() - start_time,
+                bytes_processed=0,
+                success=False,
+                error=str(e)
+            )
+            results.append(result)
+            logging.error(f"Error processing {file_info.path}: {e}")
+    
+    return results
+
+
 class MultiprocessHashProcessor:
     """Handles multiprocess file hashing with progress reporting"""
     
@@ -183,7 +232,8 @@ class MultiprocessHashProcessor:
         
         # Progress tracking
         self.progress_queues = []
-        self.results_queue = Queue()
+        # Limit queue size to prevent memory issues with large datasets
+        self.results_queue = Queue(maxsize=1000)
         self.stop_event = Event()
         self.workers = []
         
@@ -213,8 +263,8 @@ class MultiprocessHashProcessor:
         # Track total processing time
         start_time = time.time()
         
-        # Create progress queues for each worker
-        self.progress_queues = [Queue() for _ in range(len(file_lists))]
+        # Create progress queues for each worker with limited buffer size
+        self.progress_queues = [Queue(maxsize=100) for _ in range(len(file_lists))]
         
         # Start workers
         self.workers = []
@@ -246,10 +296,11 @@ class MultiprocessHashProcessor:
         # Cap at 5 minutes
         adaptive_timeout = min(estimated_time, 300.0)
         
-        # Collect results with adaptive timeout
+        # Collect results with adaptive timeout and batch processing
         timeout_start = time.time()
         timeout_duration = 300  # 5 minutes maximum timeout
         completed_workers = 0
+        results_batch_size = 1000  # Process results in batches to avoid queue overflow
         
         while completed_workers < total_workers and not self.stop_event.is_set():
             if time.time() - timeout_start > timeout_duration:
@@ -260,8 +311,9 @@ class MultiprocessHashProcessor:
                 result = self.results_queue.get(timeout=adaptive_timeout)
                 if isinstance(result, HashResult):
                     self.results.append(result)
-                    # Show progress every few seconds (or every few files for faster feedback)
-                    if not self.quiet and (time.time() - last_update > 3.0 or len(self.results) % 5 == 0):
+                    # Show progress less frequently for large datasets to reduce queue pressure
+                    progress_interval = max(100, total_files // 100)  # Dynamic interval based on total files
+                    if not self.quiet and (time.time() - last_update > 3.0 or len(self.results) % progress_interval == 0):
                         processed_bytes = sum(r.bytes_processed for r in self.results)
                         file_percentage = (len(self.results) / total_files) * 100
                         bytes_percentage = (processed_bytes / total_bytes) * 100
@@ -297,6 +349,153 @@ class MultiprocessHashProcessor:
             self.console.print(f"[green]Completed processing {len(self.results)}/{total_files} files (100.0%), {processed_bytes:,}/{total_bytes:,} bytes (100.0%)[/green]")
         
         return self.results
+    
+    def process_files_streaming(self, file_lists: List[List[FileInfo]], 
+                               output_file: Path, hash_algorithm: HashAlgorithm) -> Dict:
+        """
+        Process files and write results directly to hash file in streaming fashion
+        to avoid memory accumulation with large datasets.
+        
+        Args:
+            file_lists: List of file lists, one per worker
+            output_file: Path to output hash file
+            hash_algorithm: Hash algorithm to use
+        
+        Returns:
+            Dictionary with processing statistics
+        """
+        if not file_lists:
+            return {}
+        
+        self.results.clear()
+        self.worker_stats.clear()
+        self.stop_event.clear()
+        
+        # Track total processing time
+        start_time = time.time()
+        
+        # Create progress queues for each worker with limited buffer size
+        self.progress_queues = [Queue(maxsize=100) for _ in range(len(file_lists))]
+        
+        # Start workers
+        self.workers = []
+        for i, files in enumerate(file_lists):
+            # Always start worker, even if no files (it will send completion immediately)
+            worker = Process(
+                target=worker_process,
+                args=(i, files, self.algorithm, self.progress_queues[i], 
+                      self.stop_event, self.results_queue)
+            )
+            worker.start()
+            self.workers.append(worker)
+        
+        if not self.workers:
+            return {}
+        
+        # Collect results and write to file in streaming fashion
+        total_files = sum(len(files) for files in file_lists)
+        total_workers = len(self.workers)
+        total_bytes = sum(sum(f.size for f in files) for files in file_lists)
+        last_update = time.time()
+        
+        if not self.quiet:
+            self.console.print(f"[blue]Processing {total_files} files with {total_workers} workers (streaming mode)...[/blue]")
+        
+        # Use shorter timeout for large datasets to prevent queue overflow
+        adaptive_timeout = 5.0  # 5 seconds timeout for queue operations
+        
+        # Stream results to file
+        timeout_start = time.time()
+        timeout_duration = 300  # 5 minutes maximum timeout
+        completed_workers = 0
+        processed_count = 0
+        processed_bytes = 0
+        
+        # Collect results in batches and write to file
+        entries_batch = []
+        batch_size = 500  # Write in smaller batches to avoid memory issues
+        
+        try:
+            while completed_workers < total_workers and not self.stop_event.is_set():
+                if time.time() - timeout_start > timeout_duration:
+                    self.console.print("[yellow]Timeout reached, stopping...[/yellow]")
+                    break
+                    
+                try:
+                    result = self.results_queue.get(timeout=adaptive_timeout)
+                    if isinstance(result, HashResult):
+                        # Convert result to HashEntry
+                        from .hash_file import HashEntry
+                        entry = HashEntry(
+                            primary_hash=result.primary_hash,
+                            secondary_hash=result.secondary_hash,
+                            directory=result.file_info.directory,
+                            filename=result.file_info.filename,
+                            size=result.file_info.size,
+                            inode=result.file_info.inode,
+                            mtime=result.file_info.mtime,
+                            is_symlink=result.file_info.is_symlink
+                        )
+                        entries_batch.append(entry)
+                        
+                        processed_count += 1
+                        processed_bytes += result.bytes_processed
+                        
+                        # Write batch when it reaches batch_size
+                        if len(entries_batch) >= batch_size:
+                            self._write_batch_to_file(output_file, entries_batch, hash_algorithm, processed_count == batch_size)
+                            entries_batch.clear()
+                        
+                        # Show progress less frequently for large datasets
+                        progress_interval = max(1000, total_files // 50)  # Dynamic interval
+                        if not self.quiet and (time.time() - last_update > 5.0 or processed_count % progress_interval == 0):
+                            file_percentage = (processed_count / total_files) * 100
+                            bytes_percentage = (processed_bytes / total_bytes) * 100
+                            self.console.print(f"[blue]Processed {processed_count}/{total_files} files ({file_percentage:.1f}%), {processed_bytes:,}/{total_bytes:,} bytes ({bytes_percentage:.1f}%)[/blue]")
+                            last_update = time.time()
+                    elif isinstance(result, dict) and result.get('completed'):
+                        completed_workers += 1
+                        if 'stats' in result:
+                            self.worker_stats.append(result['stats'])
+                            if not self.quiet:
+                                self.console.print(f"[blue]Worker {result['stats'].worker_id} completed: {result['stats'].files_processed} files, {result['stats'].bytes_processed} bytes[/blue]")
+                except Exception as e:
+                    # Check if workers are still alive
+                    alive_workers = [w for w in self.workers if w.is_alive()]
+                    if not alive_workers:
+                        break
+                    # Only show timeout message if it's not just a normal timeout
+                    if not self.quiet and "Empty" not in str(e):
+                        self.console.print(f"[yellow]Timeout waiting for results (workers still processing)...[/yellow]")
+                    continue
+        
+        finally:
+            # Write remaining entries
+            if entries_batch:
+                self._write_batch_to_file(output_file, entries_batch, hash_algorithm, False)
+            
+            # Force cleanup of workers
+            for worker in self.workers:
+                if worker.is_alive():
+                    worker.terminate()
+                worker.join(timeout=2.0)
+        
+        # Store the total processing time
+        self.total_processing_time = time.time() - start_time
+        
+        if not self.quiet:
+            self.console.print(f"[green]Completed processing {processed_count}/{total_files} files (100.0%), {processed_bytes:,}/{total_bytes:,} bytes (100.0%)[/green]")
+        
+        # Return statistics
+        return {
+            'total_files': processed_count,
+            'successful': processed_count,  # All processed files are successful in streaming mode
+            'failed': 0,
+            'total_bytes': processed_bytes,
+            'total_time': self.total_processing_time,
+            'avg_speed': (processed_bytes / self.total_processing_time) / (1024 * 1024) if self.total_processing_time > 0 else 0,
+            'worker_stats': self.worker_stats
+        }
     
     
     def get_statistics(self) -> Dict:
@@ -373,6 +572,141 @@ class MultiprocessHashProcessor:
                 )
             
             self.console.print(worker_table)
+    
+    def display_statistics_from_dict(self, stats: Dict):
+        """Display statistics from a dictionary (for streaming mode)"""
+        if not stats:
+            return
+            
+        # Create main statistics table
+        main_table = Table(title="Processing Statistics")
+        main_table.add_column("Metric", style="cyan")
+        main_table.add_column("Value", justify="right")
+        
+        main_table.add_row("Total Files", str(stats.get('total_files', 0)))
+        main_table.add_row("Successful", str(stats.get('successful', 0)))
+        main_table.add_row("Failed", str(stats.get('failed', 0)))
+        main_table.add_row("Total Bytes", f"{stats.get('total_bytes', 0):,}")
+        main_table.add_row("Total Time", f"{stats.get('total_time', 0):.2f}s")
+        main_table.add_row("Avg Speed", f"{stats.get('avg_speed', 0):.2f} MB/s")
+        
+        self.console.print(main_table)
+        
+        # Display per-worker statistics if available
+        worker_stats = stats.get('worker_stats', [])
+        if worker_stats:
+            self.console.print("\n")
+            worker_table = Table(title="Per-Worker Statistics")
+            worker_table.add_column("Worker", style="cyan")
+            worker_table.add_column("Files", justify="right")
+            worker_table.add_column("Bytes", justify="right")
+            worker_table.add_column("Time", justify="right")
+            worker_table.add_column("Speed", justify="right")
+            worker_table.add_column("Errors", justify="right")
+            
+            for worker_stat in worker_stats:
+                speed_mbps = (worker_stat.bytes_processed / worker_stat.total_time) / (1024 * 1024) if worker_stat.total_time > 0 else 0
+                worker_table.add_row(
+                    f"Worker {worker_stat.worker_id}",
+                    str(worker_stat.files_processed),
+                    f"{worker_stat.bytes_processed:,}",
+                    f"{worker_stat.total_time:.2f}s",
+                    f"{speed_mbps:.2f} MB/s",
+                    str(worker_stat.errors)
+                )
+            
+            self.console.print(worker_table)
+    
+    def process_files_with_executor(self, file_lists: List[List[FileInfo]]) -> List[HashResult]:
+        """
+        Process files using ProcessPoolExecutor for better scalability with large datasets.
+        
+        Args:
+            file_lists: List of file lists, one per worker
+        
+        Returns:
+            List of HashResult objects
+        """
+        if not file_lists:
+            return []
+        
+        # Track total processing time
+        start_time = time.time()
+        
+        # Calculate total files and bytes for progress reporting
+        total_files = sum(len(files) for files in file_lists)
+        total_bytes = sum(sum(f.size for f in files) for files in file_lists)
+        
+        if not self.quiet:
+            self.console.print(f"[blue]Processing {total_files} files using ProcessPoolExecutor...[/blue]")
+        
+        all_results = []
+        processed_count = 0
+        processed_bytes = 0
+        last_update = time.time()
+        
+        # Use ProcessPoolExecutor for better scalability
+        with ProcessPoolExecutor(max_workers=len(file_lists)) as executor:
+            # Submit all batches
+            future_to_batch = {}
+            for i, files in enumerate(file_lists):
+                if files:  # Only submit non-empty batches
+                    future = executor.submit(process_files_batch, files, self.algorithm)
+                    future_to_batch[future] = (i, files)
+            
+            # Process completed batches as they finish
+            for future in as_completed(future_to_batch):
+                batch_id, batch_files = future_to_batch[future]
+                try:
+                    batch_results = future.result()
+                    all_results.extend(batch_results)
+                    
+                    # Update progress
+                    batch_processed = len(batch_results)
+                    batch_bytes = sum(r.bytes_processed for r in batch_results)
+                    processed_count += batch_processed
+                    processed_bytes += batch_bytes
+                    
+                    # Show progress updates
+                    progress_interval = max(1000, total_files // 50)  # Dynamic interval
+                    if not self.quiet and (time.time() - last_update > 2.0 or processed_count % progress_interval == 0):
+                        file_percentage = (processed_count / total_files) * 100
+                        bytes_percentage = (processed_bytes / total_bytes) * 100
+                        self.console.print(f"[blue]Processed {processed_count}/{total_files} files ({file_percentage:.1f}%), {processed_bytes:,}/{total_bytes:,} bytes ({bytes_percentage:.1f}%)[/blue]")
+                        last_update = time.time()
+                        
+                except Exception as e:
+                    logging.error(f"Batch {batch_id} failed: {e}")
+                    if not self.quiet:
+                        self.console.print(f"[red]Batch {batch_id} failed: {e}[/red]")
+        
+        # Store the total processing time
+        self.total_processing_time = time.time() - start_time
+        
+        if not self.quiet:
+            self.console.print(f"[green]Completed processing {processed_count}/{total_files} files (100.0%), {processed_bytes:,}/{total_bytes:,} bytes (100.0%)[/green]")
+        
+        # Store results for statistics
+        self.results = all_results
+        
+        return all_results
+    
+    def _write_batch_to_file(self, output_file: Path, entries_batch: List, hash_algorithm: HashAlgorithm, is_first_batch: bool):
+        """Helper method to write a batch of entries to the hash file"""
+        from .hash_file import HashFile
+        
+        # For the first batch, we need to determine the base directory
+        # We'll use the parent directory of the output file as the base
+        base_directory = output_file.parent
+        
+        hash_file = HashFile(output_file)
+        
+        if is_first_batch:
+            # Create new file with header
+            hash_file.write(entries_batch, base_directory, hash_algorithm, update_mode=False)
+        else:
+            # Append to existing file
+            hash_file.write(entries_batch, base_directory, hash_algorithm, update_mode=True)
     
     def stop(self):
         """Stop processing"""

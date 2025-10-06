@@ -92,33 +92,64 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
         
         file_lists = scanner.distribute_files_for_processing(workers)
         
-        # Process files
+        # Process files - use streaming for large datasets to avoid memory issues
         processor = MultiprocessHashProcessor(hash_algorithm, workers, quiet)
-        results = processor.process_files(file_lists)
         
-        if not results:
-            console.print("[red]No files were processed successfully[/red]")
-            return
-        
-        # Convert results to hash entries
-        entries = []
-        for result in results:
-            if result.success:
-                entry = HashEntry(
-                    primary_hash=result.primary_hash,
-                    secondary_hash=result.secondary_hash,
-                    directory=result.file_info.directory,
-                    filename=result.file_info.filename,
-                    size=result.file_info.size,
-                    inode=result.file_info.inode,
-                    mtime=result.file_info.mtime,
-                    is_symlink=result.file_info.is_symlink
-                )
-                entries.append(entry)
-        
-        # Write hash file
-        console.print(f"[blue]Writing hash file: {output}[/blue]")
-        hash_file.write(entries, directory, hash_algorithm, update_mode=update)
+        # Use ProcessPoolExecutor for large datasets (>10000 files) to avoid queue overflow
+        if len(files_to_process) > 10000:
+            console.print("[blue]Large dataset detected, using ProcessPoolExecutor...[/blue]")
+            results = processor.process_files_with_executor(file_lists)
+            
+            if not results:
+                console.print("[red]No files were processed successfully[/red]")
+                return
+            
+            # Convert results to hash entries
+            entries = []
+            for result in results:
+                if result.success:
+                    entry = HashEntry(
+                        primary_hash=result.primary_hash,
+                        secondary_hash=result.secondary_hash,
+                        directory=result.file_info.directory,
+                        filename=result.file_info.filename,
+                        size=result.file_info.size,
+                        inode=result.file_info.inode,
+                        mtime=result.file_info.mtime,
+                        is_symlink=result.file_info.is_symlink
+                    )
+                    entries.append(entry)
+            
+            # Write hash file
+            console.print(f"[blue]Writing hash file: {output}[/blue]")
+            hash_file.write(entries, directory, hash_algorithm, update_mode=update)
+        else:
+            # Use regular mode for smaller datasets
+            results = processor.process_files(file_lists)
+            
+            if not results:
+                console.print("[red]No files were processed successfully[/red]")
+                return
+            
+            # Convert results to hash entries
+            entries = []
+            for result in results:
+                if result.success:
+                    entry = HashEntry(
+                        primary_hash=result.primary_hash,
+                        secondary_hash=result.secondary_hash,
+                        directory=result.file_info.directory,
+                        filename=result.file_info.filename,
+                        size=result.file_info.size,
+                        inode=result.file_info.inode,
+                        mtime=result.file_info.mtime,
+                        is_symlink=result.file_info.is_symlink
+                    )
+                    entries.append(entry)
+            
+            # Write hash file
+            console.print(f"[blue]Writing hash file: {output}[/blue]")
+            hash_file.write(entries, directory, hash_algorithm, update_mode=update)
         
         # Display statistics
         if not quiet:
