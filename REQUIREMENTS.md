@@ -3,84 +3,67 @@
 ## Project Goals
 The idea of the app is to have one script to recursively generate hashes (MD5 or another algorithms) of files starting from some provided directory. 
 
-Also have another script to compare hashes:
-* Inside the same file, to find duplicated files
-* On different files to spot different filenames on same files (hash_file1 and hash_file2)
-
-The idea is to generate a bash script that the user can edit an run manually with some "rm" commands to remove the duplicated files (all the lines should be commented, and the user should be the one who uncomments the lines). And other "mv" lines to rename files from hash_file1 to match the new filenames on hash_file2.
-
-This should have a rich library output, and use multiprocessing library to allow generating hashes on multiple files at the same time.
-
 ## Current Limitations
 The current version changed the output on the hashes file, so old files are incompatible with new ones. New format changes should be discussed to avoid breaking backwards compatibility.
 
 ## User Experience
-First generating hashes on one directory.
-Then, for approach 1, just run the app to get duplicates. It generates the shell file, where the user can edit and execute.
-For approach 2, the user needs to generate hashes in another directory, possibly in a different computer. Then copy one of the hashes to the other machine, and run the compare script, and finally edit and execute the script to make both directories match.
+- First generating hashes on one directory.
 
-## Hash Algorithm Support ✅ COMPLETED
-- ✅ Support multiple hash algorithms: MD5, SHA-1, SHA-256, SHA-512, BLAKE2
-- ✅ User can specify algorithm via command line flag (e.g., `--algorithm SHA-256`)
-- ✅ Default algorithm: MD5 for compatibility
-- ✅ Benchmark command flag to test different algorithms on user's machine
-- ✅ User can select best algorithm for their specific hardware/use case
-- ✅ Algorithm indicated in hash format (e.g., `SHA256:hash_value`) for flexibility
+## Hash Algorithm Support
+- Support multiple hash algorithms: MD5, SHA-1, SHA-256, SHA-512, BLAKE2
+- User can specify algorithm via command line flag (e.g., `--algorithm SHA-256`)
+- Default algorithm: MD5 for compatibility
+- Benchmark command flag to test different algorithms on user's machine, allowing the user to choose a directory with test files to run the benchmark on them.
+- User can select best algorithm for their specific hardware/use case
+- Algorithm indicated in hash format (e.g., `SHA256:hash_value`) for flexibility
 
-## Multiprocessing Configuration ✅ COMPLETED
-- ✅ Default: 1 process (using multiprocessing library for consistency)
-- ✅ Command line option: `-m x` where x is number of threads
-- ✅ Special value `-m auto` uses number of detected processors
-- ✅ Load balancing: Split files by total bytes (not count) across threads
-- ✅ Randomize file order to prevent all large files being processed simultaneously
-- ✅ Individual progress bars for each thread
-- ✅ Graceful CTRL-C handling with process cleanup
+## Multiprocessing Configuration
+- Default: 1 process (using ProcessPoolExecutor always)
+- Command line option: `-w x` where x is number of workers
+- Special value `-w auto` uses number of detected processors
+- Load balancing: Split files by total bytes (not count) across threads
+- Randomize files after the split to prevent all large files being processed simultaneously
+- Graceful CTRL-C handling with process cleanup
 
-## Progress Reporting ✅ COMPLETED
-- ✅ Multiple progress bars showing each file being processed
-- ✅ Individual progress bars for each thread
-- ✅ Display total number of files to process
-- ✅ Show current filename being processed
-- ✅ Pre-scan all files to get total count and sizes before processing
-- ✅ Real-time progress updates during hash generation
-- ✅ File-level progress indication for large files
-- ✅ Thread distribution summary before processing
-- ✅ Performance statistics after processing
+## Internal communication
+- Each worker should have a pipe to communicate with the main process, and the main process should be receiving events from the workers:
+  * New hash generated for a file
+  * Status progress, after some files processed or after some megabytes.
+- The main process should be receiving these events and write to the hashes file, and also update the UI.
 
-## Command Line Interface ✅ COMPLETED
-- ✅ Use intuitive command words instead of flags for main actions
-- ✅ Commands: `generate`, `compare`, `benchmark`, `duplicates`
-- ✅ Examples:
-  - `filehasher generate /path/to/dir --algorithm SHA-256 -m 4`
-  - `filehasher generate /path/to/dir --update` (incremental updates)
-  - `filehasher compare file1.hashes file2.hashes`
-  - `filehasher duplicates file.hashes`
-  - `filehasher benchmark`
+## User Interfaces
+- A simple user interface reporting whole progress each second.
+- Adding a command line argument (it can be -i or --interactive) we should see a fullscreen user interface using Rich/Textual libraries, showing one pane for each worker. 
+  Inside the pane we'll see the name of the files being processed in the middle of the pane (vertically), including some previous ones and some next ones, and a progress bar for the current file.
+  Also we should have another pane with generic info, like the total number of files processed, total bytes processed, the total files and bytes to be processed, and a progress bar.
+  And another pane with the last lines of the hashes being written to the file.
+  Additionally, the user should be able to pause the whole process pressing the letter P, or press a button on each worker pane to pause the individual worker.
 
-## Error Handling & Edge Cases ✅ COMPLETED
-- ✅ Permission errors: Report but continue processing
-- ✅ Symlinks: Add to hash file as commented lines (starting with "#") to preserve data without processing
-- ✅ Large files: Process in chunks to avoid memory issues
-- ✅ File I/O: Handle gracefully without stopping entire process
-- ✅ CTRL-C interruption: Graceful shutdown with process cleanup
-- ✅ Chunk-based processing for memory efficiency
+## Progress Reporting
+- Pre-scan all files to get total count and sizes before processing
+- Real-time progress updates during hash generation
+- Thread distribution summary before processing
+- Performance statistics after processing
 
-## Generated Scripts ✅ COMPLETED
-- ✅ No explanatory comments or safety checks in generated scripts
-- ✅ Script names:
-  - `cleanup_duplicates.sh` for duplicate removal
-  - `sync_directories.sh` for cross-directory synchronization
-- ✅ All commands commented out by default
-- ✅ User manually uncomments and executes
+## Command Line Interface
+- We'll have different scripts to do different tasks, at this moment we'll focus on the filehasher_generator script to generate the hashes.
+- Examples:
+  - `filehashes_generator /path/to/dir --algorithm SHA-256 -w 4`
+  - `filehashes_generator /path/to/dir --algorithm SHA-256 -w 4 -i`
 
-## Hash File Format & Metadata ✅ COMPLETED
-- ✅ Hash files include metadata header as commented lines (starting with "#")
-- ✅ Header contains: machine name, base directory, username, script version, generation timestamp
-- ✅ Symlinks are recorded as commented lines to preserve data without processing
-- ✅ All comparison and processing logic skips commented lines
-- ✅ Algorithm indicated in hash format (not header) for flexibility
-- ✅ Backwards compatibility with existing MD5 hash files
-- ✅ Example header format:
+## Error Handling & Edge Cases
+- Permission errors: Report but continue processing
+- Symlinks: Add to hash file as commented lines (starting with "#") to preserve data without processing
+- Large files: Always process files in chunks to avoid memory issues
+- File I/O: Handle gracefully without stopping entire process
+
+## Hash File Format & Metadata
+- Hash files include metadata header as commented lines (starting with "#")
+- Header contains: machine name, base directory, username, script version, generation timestamp
+- Symlinks are recorded as commented lines to preserve data without processing
+- Algorithm indicated in hash format (not header) for flexibility
+- Backwards compatibility with existing MD5 hash files
+- Example header format:
   ```
   # Generated by filehasher v2.0.0
   # Machine: hostname.local
@@ -89,20 +72,12 @@ For approach 2, the user needs to generate hashes in another directory, possibly
   # Generated: 2024-01-15 14:30:25
   ```
 
-## Technical Requirements ✅ COMPLETED
-- ✅ Python 3.8+ support
-- ✅ External dependencies: Rich (UI), Click (CLI) - well-known and stable
-- ✅ Chunk-based file processing for memory efficiency
-- ✅ Memory-efficient file listing before processing
-- ✅ Incremental updates with `--update` parameter
-- ✅ Performance monitoring and statistics
+## Technical Requirements
+- Python 3.8+ support
+- External dependencies: Rich (UI) - well-known and stable
+- Chunk-based file processing for memory efficiency
+- Memory-efficient file listing before processing
+- Incremental updates with `--update` parameter
+- Performance monitoring and statistics
 
-## Success Criteria ✅ ACHIEVED
-- ✅ Both approaches implemented and tested successfully
-- ✅ Incremental updates working with `--update` parameter
-- ✅ Cross-directory comparison working
-- ✅ Duplicate detection working
-- ✅ Script generation working
-- ✅ All multiprocessing features working
-- ✅ Performance monitoring and statistics implemented
-- ✅ Graceful error handling and signal processing
+## Success Criteria
