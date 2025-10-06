@@ -260,9 +260,12 @@ class MultiprocessHashProcessor:
                 result = self.results_queue.get(timeout=adaptive_timeout)
                 if isinstance(result, HashResult):
                     self.results.append(result)
-                    # Show progress every few seconds
-                    if not self.quiet and time.time() - last_update > 3.0:
-                        self.console.print(f"[blue]Processed {len(self.results)}/{total_files} files...[/blue]")
+                    # Show progress every few seconds (or every few files for faster feedback)
+                    if not self.quiet and (time.time() - last_update > 3.0 or len(self.results) % 5 == 0):
+                        processed_bytes = sum(r.bytes_processed for r in self.results)
+                        file_percentage = (len(self.results) / total_files) * 100
+                        bytes_percentage = (processed_bytes / total_bytes) * 100
+                        self.console.print(f"[blue]Processed {len(self.results)}/{total_files} files ({file_percentage:.1f}%), {processed_bytes:,}/{total_bytes:,} bytes ({bytes_percentage:.1f}%)[/blue]")
                         last_update = time.time()
                 elif isinstance(result, dict) and result.get('completed'):
                     completed_workers += 1
@@ -290,7 +293,8 @@ class MultiprocessHashProcessor:
         self.total_processing_time = time.time() - start_time
         
         if not self.quiet:
-            self.console.print(f"[green]Completed processing {len(self.results)} files[/green]")
+            processed_bytes = sum(r.bytes_processed for r in self.results)
+            self.console.print(f"[green]Completed processing {len(self.results)}/{total_files} files (100.0%), {processed_bytes:,}/{total_bytes:,} bytes (100.0%)[/green]")
         
         return self.results
     
