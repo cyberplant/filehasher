@@ -73,7 +73,8 @@ class HashCalculator:
                 'bytes_processed': bytes_processed,
                 'current_file': file_path,
                 'files_processed': files_processed,
-                'message_type': 'progress'
+                'file_size': file_size,
+                'message_type': 'file_progress'
             }
             sock.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.udp_progress_port))
             sock.close()

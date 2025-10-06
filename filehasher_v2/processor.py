@@ -71,6 +71,7 @@ class UDPProgressListener:
         self.worker_stats = {}
         self.total_files_processed = 0
         self.total_bytes_processed = 0
+        self.current_file_progress = {}  # Track file-level progress per worker
         self.lock = threading.Lock()
         self.progress_callback = progress_callback
         self.update_interval = 1.0  # Update every second
@@ -121,6 +122,7 @@ class UDPProgressListener:
                 }
             
             if message['message_type'] == 'progress':
+                # File-level progress (file completed)
                 self.worker_stats[worker_id]['files_processed'] = message['files_processed']
                 self.worker_stats[worker_id]['bytes_processed'] = message['bytes_processed']
                 
@@ -134,6 +136,19 @@ class UDPProgressListener:
                     current_time - self.last_update_time >= self.update_interval):
                     should_call_callback = True
                     self.last_update_time = current_time
+                    
+            elif message['message_type'] == 'file_progress':
+                # File-level progress (bytes processed within current file)
+                self.current_file_progress[worker_id] = {
+                    'current_file': message['current_file'],
+                    'bytes_processed': message['bytes_processed'],
+                    'file_size': message.get('file_size', 0),
+                    'files_processed': message['files_processed']
+                }
+                
+                # Always call callback for file_progress to show real-time file progress
+                if self.progress_callback:
+                    should_call_callback = True
         
         # Call progress callback outside of lock to avoid deadlocks
         if should_call_callback:
@@ -150,7 +165,8 @@ class UDPProgressListener:
             return {
                 'files_processed': self.total_files_processed,
                 'bytes_processed': self.total_bytes_processed,
-                'worker_stats': self.worker_stats.copy()
+                'worker_stats': self.worker_stats.copy(),
+                'current_file_progress': self.current_file_progress.copy()
             }
 
 
@@ -383,9 +399,24 @@ class HashProcessor:
         file_percent = (files_processed / total_files * 100) if total_files > 0 else 0
         byte_percent = (bytes_processed / total_bytes * 100) if total_bytes > 0 else 0
         
-        print(f"\rProcessed {files_processed}/{total_files} files ({file_percent:.1f}%), "
-              f"{self._format_bytes(bytes_processed)}/{self._format_bytes(total_bytes)} ({byte_percent:.1f}%)", 
-              end='', flush=True)
+        # Build progress line
+        progress_line = f"\rProcessed {files_processed}/{total_files} files ({file_percent:.1f}%), " \
+                       f"{self._format_bytes(bytes_processed)}/{self._format_bytes(total_bytes)} ({byte_percent:.1f}%)"
+        
+        # Add current file progress if available
+        current_file_progress = progress.get('current_file_progress', {})
+        if current_file_progress:
+            # Show progress for the first active worker
+            for worker_id, file_progress in current_file_progress.items():
+                if file_progress.get('file_size', 0) > 0:
+                    current_file = Path(file_progress['current_file']).name if file_progress['current_file'] else "unknown"
+                    file_bytes = file_progress['bytes_processed']
+                    file_size = file_progress['file_size']
+                    file_percent = (file_bytes / file_size * 100) if file_size > 0 else 0
+                    progress_line += f" | {current_file}: {self._format_bytes(file_bytes)}/{self._format_bytes(file_size)} ({file_percent:.1f}%)"
+                break  # Only show one worker's current file progress
+        
+        print(progress_line, end='', flush=True)
     
     
     
