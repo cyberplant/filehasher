@@ -346,7 +346,15 @@ class HashProcessor:
                 self._show_progress_update(progress_data, progress_tracker)
         
         # Start UDP progress listener with callback (will be updated with hash file handle later)
-        self._udp_listener = UDPProgressListener(progress_callback=progress_callback, debug=debug)
+        # Check for custom UDP port from environment variable
+        udp_port = 0
+        if 'FILEHASHER_UDP_PORT' in os.environ:
+            try:
+                udp_port = int(os.environ['FILEHASHER_UDP_PORT'])
+            except ValueError:
+                pass  # Use default port 0
+        
+        self._udp_listener = UDPProgressListener(port=udp_port, progress_callback=progress_callback, debug=debug)
         self._udp_listener.start()
         
         try:

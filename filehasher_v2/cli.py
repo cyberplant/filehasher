@@ -35,6 +35,24 @@ def _format_bytes(bytes_value: int) -> str:
     return f"{bytes_value:.1f} PB"
 
 
+def _parse_workers(workers_str: str) -> int:
+    """Parse workers argument and return number of workers."""
+    import multiprocessing
+    
+    if workers_str.lower() == 'auto':
+        return multiprocessing.cpu_count()
+    elif workers_str == '0':
+        return multiprocessing.cpu_count()
+    else:
+        try:
+            workers = int(workers_str)
+            if workers < 1:
+                raise ValueError("Number of workers must be at least 1")
+            return workers
+        except ValueError as e:
+            raise ValueError(f"Invalid workers value '{workers_str}': {e}")
+
+
 def generate_command(args):
     """Generate hash file for a directory."""
     try:
@@ -69,11 +87,24 @@ def generate_command(args):
             console.print("[yellow]No files to process[/yellow]")
             return 0
         
+        # Check if interactive mode is requested
+        if args.interactive:
+            from .interactive_ui import run_interactive_ui
+            num_workers = _parse_workers(args.workers)
+            console.print(f"[blue]Starting interactive UI for {len(files)} files with {num_workers} workers...[/blue]")
+            return run_interactive_ui(
+                str(args.directory),
+                str(args.output),
+                algorithm,
+                num_workers
+            )
+        
         # Create processor
-        processor = HashProcessor(algorithm=algorithm, num_workers=args.workers)
+        num_workers = _parse_workers(args.workers)
+        processor = HashProcessor(algorithm=algorithm, num_workers=num_workers)
         
         # Process files
-        console.print(f"[blue]Processing {len(files)} files with {args.workers} workers...[/blue]")
+        console.print(f"[blue]Processing {len(files)} files with {num_workers} workers...[/blue]")
         success = processor.process_directory(
             str(args.directory), 
             str(args.output), 
@@ -169,8 +200,8 @@ Examples:
                                help='Hash algorithm (default: md5)')
     generate_parser.add_argument('--output', '-o', type=Path, 
                                help='Output hash file path (default: directory.hashes)')
-    generate_parser.add_argument('--workers', '-w', type=int, default=None,
-                               help='Number of worker processes (default: CPU count)')
+    generate_parser.add_argument('--workers', '-w', type=str, default='1',
+                               help='Number of worker processes (default: 1, use "auto" for CPU count)')
     generate_parser.add_argument('--quiet', '-q', action='store_true', 
                                help='Suppress progress output')
     generate_parser.add_argument('--follow-symlinks', action='store_true', 
@@ -185,6 +216,8 @@ Examples:
                                help='Update mode: skip files that match existing hash file entries')
     generate_parser.add_argument('--ignore-mtime', action='store_true',
                                help='In update mode, ignore modification time comparison (only compare filename and size)')
+    generate_parser.add_argument('--interactive', '-i', action='store_true',
+                               help='Enable full screen interactive UI with worker panes and progress display')
     
     # Benchmark command
     benchmark_parser = subparsers.add_parser('benchmark', help='Benchmark hash algorithms')
