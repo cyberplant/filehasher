@@ -56,8 +56,14 @@ def generate_command(args):
         
         # Scan directory
         console.print(f"[blue]Scanning directory: {args.directory}[/blue]")
+        if args.debug:
+            print("DEBUG CLI: Creating FileScanner...")
         scanner = FileScanner(str(args.directory), follow_symlinks=args.follow_symlinks)
+        if args.debug:
+            print("DEBUG CLI: Scanning directory...")
         files, symlinks = scanner.scan_directory()
+        if args.debug:
+            print(f"DEBUG CLI: Found {len(files)} files")
         
         if not files:
             console.print("[yellow]No files to process[/yellow]")
@@ -73,7 +79,8 @@ def generate_command(args):
             str(args.output), 
             follow_symlinks=args.follow_symlinks,
             quiet=args.quiet,
-            create_new_file=args.new
+            create_new_file=args.new,
+            debug=args.debug
         )
         
         if success:
@@ -170,6 +177,8 @@ Examples:
                                help='Overwrite output file without prompting')
     generate_parser.add_argument('--new', '-n', action='store_true', 
                                help='Generate a new file from scratch (default: update/append to existing file)')
+    generate_parser.add_argument('--debug', '-d', action='store_true', 
+                               help='Enable debug output for troubleshooting')
     
     # Benchmark command
     benchmark_parser = subparsers.add_parser('benchmark', help='Benchmark hash algorithms')

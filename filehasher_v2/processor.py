@@ -64,7 +64,7 @@ class UDPProgressMessage:
 class UDPProgressListener:
     """UDP listener for progress updates from workers."""
     
-    def __init__(self, port: int = 0):
+    def __init__(self, port: int = 0, progress_callback=None, debug: bool = False):
         self.port = port
         self.sock = None
         self.listening = False
@@ -72,6 +72,10 @@ class UDPProgressListener:
         self.total_files_processed = 0
         self.total_bytes_processed = 0
         self.lock = threading.Lock()
+        self.progress_callback = progress_callback
+        self.update_interval = 1.0  # Update every second
+        self.last_update_time = 0
+        self.debug = debug
     
     def start(self):
         """Start UDP listener."""
@@ -102,8 +106,11 @@ class UDPProgressListener:
     
     def _handle_message(self, message: dict):
         """Handle incoming progress message."""
+        if self.debug:
+            print(f"DEBUG: UDP message received: {message}")
+        should_call_callback = False
+        
         with self.lock:
-            print("Received message:", message)
             worker_id = message['worker_id']
             
             if worker_id not in self.worker_stats:
@@ -120,6 +127,22 @@ class UDPProgressListener:
                 # Update totals
                 self.total_files_processed = sum(ws['files_processed'] for ws in self.worker_stats.values())
                 self.total_bytes_processed = sum(ws['bytes_processed'] for ws in self.worker_stats.values())
+                
+                # Check if we should call progress callback
+                current_time = time.time()
+                if (self.progress_callback and 
+                    current_time - self.last_update_time >= self.update_interval):
+                    should_call_callback = True
+                    self.last_update_time = current_time
+        
+        # Call progress callback outside of lock to avoid deadlocks
+        if should_call_callback:
+            if self.debug:
+                print("DEBUG: Calling progress callback...")
+            progress_data = self.get_progress()
+            self.progress_callback(progress_data)
+            if self.debug:
+                print("DEBUG: Progress callback completed")
     
     def get_progress(self) -> Dict[str, Any]:
         """Get current progress."""
@@ -151,10 +174,10 @@ class HashProcessor:
         """Handle interrupt signals for graceful shutdown."""
         self._interrupted = True
         print(f"\nReceived signal {signum}, shutting down gracefully...")
-        self._cleanup_processes()
+        self._cleanup_executor()
     
     def process_directory(self, directory: str, output_path: str, follow_symlinks: bool = False, 
-                         quiet: bool = False, create_new_file: bool = False) -> bool:
+                         quiet: bool = False, create_new_file: bool = False, debug: bool = False) -> bool:
         """
         Process a directory and generate hash file using ProcessPoolExecutor.
         
@@ -164,6 +187,7 @@ class HashProcessor:
             follow_symlinks: Whether to follow symbolic links
             quiet: Whether to suppress progress output
             create_new_file: Whether to create a new file from scratch (True) or update/append (False)
+            debug: Whether to show debug output
             
         Returns:
             True if successful, False if interrupted or failed
@@ -196,7 +220,7 @@ class HashProcessor:
                 self._initialize_hash_file(output_path, directory)
             
             # Process files using ProcessPoolExecutor
-            success = self._process_files_with_processpool(worker_files, output_path, symlinks, quiet, create_new_file)
+            success = self._process_files_with_processpool(worker_files, output_path, symlinks, quiet, create_new_file, debug)
             
             if success and not quiet:
                 self._print_final_stats()
@@ -211,7 +235,7 @@ class HashProcessor:
             self._cleanup_executor()
     
     def _process_files_with_processpool(self, worker_files: List[List[FileInfo]], output_path: str, 
-                                       symlinks: List[FileInfo], quiet: bool, create_new_file: bool = False) -> bool:
+                                       symlinks: List[FileInfo], quiet: bool, create_new_file: bool = False, debug: bool = False) -> bool:
         """
         Process files using ProcessPoolExecutor with progress communication.
         
@@ -221,6 +245,7 @@ class HashProcessor:
             symlinks: List of symlink entries
             quiet: Whether to suppress progress output
             create_new_file: Whether to create a new file from scratch (True) or update/append (False)
+            debug: Whether to show debug output
             
         Returns:
             True if successful, False if interrupted
@@ -229,8 +254,6 @@ class HashProcessor:
         self._worker_stats.clear()
         
         start_time = time.time()
-        last_update = start_time
-        update_interval = 1.0  # Update every second
         
         # Flatten all files for processing
         all_files = []
@@ -241,11 +264,11 @@ class HashProcessor:
             return True
         
         # Create ProcessPoolExecutor
+        if debug:
+            print("DEBUG: Creating ProcessPoolExecutor...")
         self._executor = ProcessPoolExecutor(max_workers=self.num_workers)
-        
-        # Start UDP progress listener
-        self._udp_listener = UDPProgressListener()
-        self._udp_listener.start()
+        if debug:
+            print("DEBUG: ProcessPoolExecutor created")
         
         # Create progress tracking
         progress_tracker = {
@@ -254,6 +277,17 @@ class HashProcessor:
             'total_files': len(all_files),
             'total_bytes': sum(f.size for f in all_files)
         }
+        
+        # Create progress callback for real-time updates
+        def progress_callback(progress_data):
+            if not quiet:
+                if debug:
+                    print(f"\nDEBUG: Progress callback called with data: {progress_data}")
+                self._show_progress_update(progress_data, progress_tracker)
+        
+        # Start UDP progress listener with callback
+        self._udp_listener = UDPProgressListener(progress_callback=progress_callback, debug=debug)
+        self._udp_listener.start()
         
         try:
             # Distribute files in batches to workers
@@ -292,14 +326,6 @@ class HashProcessor:
                             for result in results:
                                 self._write_hash_entry(hash_file, result)
                                 self._results.append(result)
-                            
-                            # Show progress update if not quiet
-                            current_time = time.time()
-                            if not quiet and current_time - last_update >= update_interval:
-                                # Get progress from UDP listener
-                                progress = self._udp_listener.get_progress()
-                                self._show_progress_update(progress, progress_tracker)
-                                last_update = current_time
                     
                     except Exception as e:
                         batch = future_to_batch[future]

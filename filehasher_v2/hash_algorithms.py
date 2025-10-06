@@ -40,11 +40,7 @@ class HashCalculator:
         self._hasher = self._create_hasher()
         self.worker_id = worker_id
         self.notify_progress_chunks = notify_progress_chunks
-        print("init 1")
         self.udp_progress_port = udp_progress_port
-        print("init 2")
-        print("udp_progress_port", self.udp_progress_port)
-        print("notify_progress_chunks", self.notify_progress_chunks)
     
     def _create_hasher(self):
         """Create a new hasher instance for the current algorithm."""
@@ -67,17 +63,22 @@ class HashCalculator:
         """
         Update progress of the hash calculation.
         """
-        print("Sending progress update to UDP:", self.udp_progress_port)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        message = {
-            'worker_id': self.worker_id,
-            'bytes_processed': bytes_processed,
-            'current_file': file_path,
-            'files_processed': files_processed,
-            'message_type': 'progress'
-        }
-        sock.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.udp_progress_port))
-        sock.close()
+        if self.udp_progress_port is None:
+            return
+            
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            message = {
+                'worker_id': self.worker_id,
+                'bytes_processed': bytes_processed,
+                'current_file': file_path,
+                'files_processed': files_processed,
+                'message_type': 'progress'
+            }
+            sock.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.udp_progress_port))
+            sock.close()
+        except:
+            pass  # Ignore UDP errors
 
     def calculate_file_hash(self, file_path: str, files_processed: int, chunk_size: int = 8192) -> str:
         """
@@ -99,8 +100,7 @@ class HashCalculator:
                 while chunk := f.read(chunk_size):
                     hasher.update(chunk)
                     bytes_processed += len(chunk)
-                    if self.notify_progress_chunks > 0 and bytes_processed % self.notify_progress_chunks == 0:
-                        print("Sending progress update to UDP:", self.udp_progress_port)
+                    if self.notify_progress_chunks > 0 and bytes_processed % (self.notify_progress_chunks * chunk_size) == 0:
                         self.update_progress(file_path, files_processed, bytes_processed, file_size)
             return hasher.hexdigest()
         except (IOError, OSError) as e:

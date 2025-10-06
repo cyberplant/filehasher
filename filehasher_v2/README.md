@@ -56,6 +56,9 @@ python -m filehasher_v2 generate /path/to/dir --follow-symlinks
 
 # Quiet mode (minimal output)
 python -m filehasher_v2 generate /path/to/dir --quiet
+
+# Debug mode (detailed troubleshooting output)
+python -m filehasher_v2 generate /path/to/dir --debug
 ```
 
 ### Benchmark Algorithms
@@ -93,6 +96,7 @@ To create a completely new file from scratch (overwriting existing files), use t
 - `--quiet, -q`: Suppress progress output
 - `--force, -f`: Overwrite output file without prompting (when using --new)
 - `--new, -n`: Create new file from scratch (default: update/append mode)
+- `--debug, -d`: Enable debug output for troubleshooting
 
 ### Duplicates Command
 - `--output, -o`: Output script path (default: cleanup_duplicates.sh)
