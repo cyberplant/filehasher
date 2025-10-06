@@ -225,7 +225,8 @@ class HashProcessor:
         self._cleanup_executor()
     
     def process_directory(self, directory: str, output_path: str, follow_symlinks: bool = False, 
-                         quiet: bool = False, create_new_file: bool = False, debug: bool = False) -> bool:
+                         quiet: bool = False, create_new_file: bool = False, debug: bool = False,
+                         update_mode: bool = False, ignore_mtime: bool = False) -> bool:
         """
         Process a directory and generate hash file using ProcessPoolExecutor.
         
@@ -236,6 +237,8 @@ class HashProcessor:
             quiet: Whether to suppress progress output
             create_new_file: Whether to create a new file from scratch (True) or update/append (False)
             debug: Whether to show debug output
+            update_mode: Whether to skip files that match existing hash file entries
+            ignore_mtime: In update mode, ignore modification time comparison
             
         Returns:
             True if successful, False if interrupted or failed
@@ -256,6 +259,15 @@ class HashProcessor:
                 print(f"Found {len(files)} files ({scanner.get_total_size():,} bytes)")
                 if symlinks:
                     print(f"Found {len(symlinks)} symlinks")
+            
+            # Apply update mode filtering if enabled
+            if update_mode:
+                files = self._filter_files_for_update(files, output_path, ignore_mtime, quiet, debug)
+                if not files:
+                    print("All files are up to date, nothing to process.")
+                    return True
+                if not quiet:
+                    print(f"After update filtering: {len(files)} files to process ({sum(f.size for f in files):,} bytes)")
             
             # Distribute files across workers
             worker_files = scanner.distribute_files(self.num_workers)
@@ -567,6 +579,98 @@ class HashProcessor:
             return f"{int(size)} {units[unit_index]}"
         else:
             return f"{size:.1f} {units[unit_index]}"
+    
+    def _filter_files_for_update(self, files: List['FileInfo'], output_path: str, 
+                                ignore_mtime: bool, quiet: bool, debug: bool) -> List['FileInfo']:
+        """
+        Filter files for update mode by comparing with existing hash file entries.
+        
+        Args:
+            files: List of files to filter
+            output_path: Path to existing hash file
+            ignore_mtime: Whether to ignore modification time comparison
+            quiet: Whether to suppress output
+            debug: Whether to show debug output
+            
+        Returns:
+            List of files that need to be processed (don't match existing entries)
+        """
+        if not Path(output_path).exists():
+            if debug:
+                print("DEBUG: Hash file doesn't exist, processing all files")
+            return files
+        
+        try:
+            from .hash_file import HashFileReader
+            reader = HashFileReader(output_path)
+            existing_entries, _ = reader.read_file()
+            
+            if debug:
+                print(f"DEBUG: Loaded {len(existing_entries)} existing hash entries")
+            
+            # Create a lookup dictionary for faster comparison
+            existing_lookup = {}
+            for entry in existing_entries:
+                # Create relative path from directory and filename
+                if entry.directory == '.':
+                    relative_path = entry.filename
+                else:
+                    relative_path = f"{entry.directory}/{entry.filename}"
+                existing_lookup[relative_path] = entry
+            
+            if debug:
+                print(f"DEBUG: Created lookup for {len(existing_lookup)} existing files")
+            
+            files_to_process = []
+            skipped_count = 0
+            
+            for file_info in files:
+                # Check if file exists in hash file
+                if file_info.relative_path in existing_lookup:
+                    existing_entry = existing_lookup[file_info.relative_path]
+                    
+                    # Compare file attributes
+                    size_match = existing_entry.size == file_info.size
+                    mtime_match = existing_entry.mtime == file_info.mtime
+                    
+                    if ignore_mtime:
+                        # Only compare filename and size
+                        if size_match:
+                            skipped_count += 1
+                            if debug:
+                                print(f"DEBUG: Skipping {file_info.relative_path} (size match, ignoring mtime)")
+                            continue
+                        else:
+                            if debug:
+                                print(f"DEBUG: Processing {file_info.relative_path} (size mismatch: {existing_entry.size} vs {file_info.size})")
+                    else:
+                        # Compare filename, size, and modification time
+                        if size_match and mtime_match:
+                            skipped_count += 1
+                            if debug:
+                                print(f"DEBUG: Skipping {file_info.relative_path} (size and mtime match)")
+                            continue
+                        else:
+                            if debug:
+                                size_diff = "match" if size_match else f"mismatch ({existing_entry.size} vs {file_info.size})"
+                                mtime_diff = "match" if mtime_match else f"mismatch ({existing_entry.mtime} vs {file_info.mtime})"
+                                print(f"DEBUG: Processing {file_info.relative_path} (size: {size_diff}, mtime: {mtime_diff})")
+                
+                # File not in hash file or doesn't match - needs processing
+                files_to_process.append(file_info)
+            
+            if not quiet:
+                print(f"Update mode: Skipped {skipped_count} unchanged files, processing {len(files_to_process)} files")
+            
+            return files_to_process
+            
+        except Exception as e:
+            if debug:
+                print(f"DEBUG: Error reading hash file for update mode: {e}")
+            if not quiet:
+                print(f"Warning: Could not read existing hash file for update mode: {e}")
+                print("Processing all files...")
+            return files
     
     def _cleanup_executor(self):
         """Clean up ProcessPoolExecutor and UDP listener."""

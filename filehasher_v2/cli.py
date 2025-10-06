@@ -80,7 +80,9 @@ def generate_command(args):
             follow_symlinks=args.follow_symlinks,
             quiet=args.quiet,
             create_new_file=args.new,
-            debug=args.debug
+            debug=args.debug,
+            update_mode=args.update,
+            ignore_mtime=args.ignore_mtime
         )
         
         if success:
@@ -179,6 +181,10 @@ Examples:
                                help='Generate a new file from scratch (default: update/append to existing file)')
     generate_parser.add_argument('--debug', '-d', action='store_true', 
                                help='Enable debug output for troubleshooting')
+    generate_parser.add_argument('--update', '-u', action='store_true',
+                               help='Update mode: skip files that match existing hash file entries')
+    generate_parser.add_argument('--ignore-mtime', action='store_true',
+                               help='In update mode, ignore modification time comparison (only compare filename and size)')
     
     # Benchmark command
     benchmark_parser = subparsers.add_parser('benchmark', help='Benchmark hash algorithms')
