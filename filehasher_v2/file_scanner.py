@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Generator
 from dataclasses import dataclass
 import logging
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,9 @@ class FileScanner:
             worker_files[min_worker].append(file_info)
             worker_loads[min_worker] += file_info.size
         
+        for id_worker in range(num_workers):
+            random.shuffle(worker_files[id_worker])
+
         # Log distribution summary
         logger.info("File distribution across workers:")
         for i, (files, load) in enumerate(zip(worker_files, worker_loads)):
