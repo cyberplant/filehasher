@@ -13,7 +13,7 @@ A modern file hashing tool with advanced multiprocessing support and beautiful C
 - **Symlink Support**: Handle symbolic links gracefully as commented entries
 - **Signal Handling**: Graceful CTRL-C interruption with process cleanup
 - **Robust Error Handling**: Continue processing even when individual files fail
-- **File Overwrite Protection**: Ask before overwriting existing hash files
+- **Update Mode by Default**: Append to existing hash files by default; use --new flag to create from scratch
 
 ## Installation
 
@@ -42,8 +42,11 @@ python -m filehasher_v2 generate /path/to/directory --quiet
 ### Advanced Usage
 
 ```bash
-# Generate with custom output file
+# Generate with custom output file (update/append mode by default)
 python -m filehasher_v2 generate /path/to/dir --output my_hashes.txt
+
+# Create new file from scratch (overwrites existing)
+python -m filehasher_v2 generate /path/to/dir --output my_hashes.txt --new
 
 # Use all CPU cores
 python -m filehasher_v2 generate /path/to/dir --workers auto
@@ -70,12 +73,26 @@ python -m filehasher_v2 benchmark --size 50
 
 ## Command Options
 
+### File Creation Modes
+
+By default, filehasher operates in **update/append mode**:
+- If the output file doesn't exist, it creates a new file with headers
+- If the output file exists, it appends new hash entries to the existing file
+- This allows you to incrementally build hash files over time
+
+To create a completely new file from scratch (overwriting existing files), use the `--new` flag:
+- This will overwrite any existing output file
+- A fresh header will be written
+- All previous entries will be lost
+
 ### Generate Command
 - `--algorithm, -a`: Hash algorithm (md5, sha1, sha256, sha512, blake2b, blake2s)
 - `--output, -o`: Output hash file path (default: .hashes)
 - `--workers, -w`: Number of worker processes (default: CPU count)
 - `--follow-symlinks`: Follow symbolic links
 - `--quiet, -q`: Suppress progress output
+- `--force, -f`: Overwrite output file without prompting (when using --new)
+- `--new, -n`: Create new file from scratch (default: update/append mode)
 
 ### Duplicates Command
 - `--output, -o`: Output script path (default: cleanup_duplicates.sh)

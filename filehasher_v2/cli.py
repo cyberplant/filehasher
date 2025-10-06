@@ -45,12 +45,14 @@ def generate_command(args):
         if args.output is None:
             args.output = args.directory.with_suffix('.hashes')
         
-        # Check if output file exists and handle overwrite
-        if args.output.exists() and not args.force:
+        # Check if output file exists and handle overwrite vs update mode
+        if args.output.exists() and args.new and not args.force:
             response = input(f"Output file '{args.output}' already exists. Overwrite? [y/N]: ")
             if response.lower() not in ['y', 'yes']:
                 print("Operation cancelled.")
                 return 1
+        elif args.output.exists() and not args.new:
+            console.print(f"[blue]Output file '{args.output}' exists. Updating/append mode enabled.[/blue]")
         
         # Scan directory
         console.print(f"[blue]Scanning directory: {args.directory}[/blue]")
@@ -70,7 +72,8 @@ def generate_command(args):
             str(args.directory), 
             str(args.output), 
             follow_symlinks=args.follow_symlinks,
-            quiet=args.quiet
+            quiet=args.quiet,
+            create_new_file=args.new
         )
         
         if success:
@@ -139,7 +142,8 @@ def create_parser():
 Examples:
   filehasher generate /path/to/directory
   filehasher generate /path/to/directory --algorithm sha256 --workers 8
-  filehasher generate /path/to/directory --output custom.hashes --force
+  filehasher generate /path/to/directory --output custom.hashes --new
+  filehasher generate /path/to/directory --output custom.hashes --force --new
   filehasher benchmark --size 100 --algorithms md5,sha256,sha512
         """
     )
@@ -164,6 +168,8 @@ Examples:
                                help='Follow symbolic links')
     generate_parser.add_argument('--force', '-f', action='store_true', 
                                help='Overwrite output file without prompting')
+    generate_parser.add_argument('--new', '-n', action='store_true', 
+                               help='Generate a new file from scratch (default: update/append to existing file)')
     
     # Benchmark command
     benchmark_parser = subparsers.add_parser('benchmark', help='Benchmark hash algorithms')

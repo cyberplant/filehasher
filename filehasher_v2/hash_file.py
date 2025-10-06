@@ -90,9 +90,30 @@ class HashFileWriter:
         
         self._entries.append(entry)
     
-    def write_file(self, base_directory: str):
+    def write_file(self, base_directory: str, append_mode: bool = False):
         """
         Write all entries to the hash file.
+        
+        Args:
+            base_directory: Base directory that was scanned
+            append_mode: If True, append to existing file; if False, create new file
+        """
+        # Create output directory if it doesn't exist
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        mode = 'a' if append_mode else 'w'
+        with open(self.output_path, mode, encoding='utf-8') as f:
+            # Write metadata header only if creating new file
+            if not append_mode:
+                self._write_header(f, base_directory)
+            
+            # Write hash entries
+            for entry in self._entries:
+                self._write_entry(f, entry)
+    
+    def write_header_only(self, base_directory: str):
+        """
+        Write only the metadata header to a new file.
         
         Args:
             base_directory: Base directory that was scanned
@@ -103,10 +124,6 @@ class HashFileWriter:
         with open(self.output_path, 'w', encoding='utf-8') as f:
             # Write metadata header
             self._write_header(f, base_directory)
-            
-            # Write hash entries
-            for entry in self._entries:
-                self._write_entry(f, entry)
     
     def _write_header(self, file_handle, base_directory: str):
         """

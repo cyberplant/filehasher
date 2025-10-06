@@ -103,6 +103,7 @@ class UDPProgressListener:
     def _handle_message(self, message: dict):
         """Handle incoming progress message."""
         with self.lock:
+            print("Received message:", message)
             worker_id = message['worker_id']
             
             if worker_id not in self.worker_stats:
@@ -153,7 +154,7 @@ class HashProcessor:
         self._cleanup_processes()
     
     def process_directory(self, directory: str, output_path: str, follow_symlinks: bool = False, 
-                         quiet: bool = False) -> bool:
+                         quiet: bool = False, create_new_file: bool = False) -> bool:
         """
         Process a directory and generate hash file using ProcessPoolExecutor.
         
@@ -162,6 +163,7 @@ class HashProcessor:
             output_path: Output hash file path
             follow_symlinks: Whether to follow symbolic links
             quiet: Whether to suppress progress output
+            create_new_file: Whether to create a new file from scratch (True) or update/append (False)
             
         Returns:
             True if successful, False if interrupted or failed
@@ -189,11 +191,12 @@ class HashProcessor:
             if not quiet:
                 scanner.print_distribution_summary(worker_files)
             
-            # Initialize hash file with headers
-            self._initialize_hash_file(output_path, directory)
+            # Initialize hash file with headers (only if creating new file)
+            if create_new_file:
+                self._initialize_hash_file(output_path, directory)
             
             # Process files using ProcessPoolExecutor
-            success = self._process_files_with_processpool(worker_files, output_path, symlinks, quiet)
+            success = self._process_files_with_processpool(worker_files, output_path, symlinks, quiet, create_new_file)
             
             if success and not quiet:
                 self._print_final_stats()
@@ -208,7 +211,7 @@ class HashProcessor:
             self._cleanup_executor()
     
     def _process_files_with_processpool(self, worker_files: List[List[FileInfo]], output_path: str, 
-                                       symlinks: List[FileInfo], quiet: bool) -> bool:
+                                       symlinks: List[FileInfo], quiet: bool, create_new_file: bool = False) -> bool:
         """
         Process files using ProcessPoolExecutor with progress communication.
         
@@ -217,6 +220,7 @@ class HashProcessor:
             output_path: Path to hash file
             symlinks: List of symlink entries
             quiet: Whether to suppress progress output
+            create_new_file: Whether to create a new file from scratch (True) or update/append (False)
             
         Returns:
             True if successful, False if interrupted
@@ -340,7 +344,7 @@ class HashProcessor:
         
         # Write headers only
         writer = HashFileWriter(output_path, self.algorithm)
-        writer.write_file(base_directory)
+        writer.write_header_only(base_directory)
     
     def _show_progress_update(self, progress: Dict[str, Any], progress_tracker: Dict[str, Any]):
         """Show progress update."""
@@ -491,7 +495,9 @@ def process_file_batch_with_udp(worker_id: int, file_batch: List[FileInfo], algo
             except:
                 pass  # Ignore UDP errors
         
-        calculator = HashCalculator(algorithm, 100, udp_port)
+        notify_chunks = 10
+        chunk_size = 1024*1024
+        calculator = HashCalculator(algorithm, worker_id, notify_chunks, udp_port)
         results = []
         files_processed = 0
         bytes_processed = 0
@@ -499,7 +505,7 @@ def process_file_batch_with_udp(worker_id: int, file_batch: List[FileInfo], algo
         for file_info in file_batch:
             try:
                 # Calculate file hash
-                file_hash = calculator.calculate_file_hash(file_info.path)
+                file_hash = calculator.calculate_file_hash(file_info.path, files_processed, chunk_size)
                 
                 # Calculate metadata hash
                 filename = Path(file_info.relative_path).name

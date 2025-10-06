@@ -35,9 +35,10 @@ class BenchmarkResult:
 class HashCalculator:
     """Handles hash calculation for different algorithms."""
     
-    def __init__(self, algorithm: HashAlgorithm = HashAlgorithm.MD5, notify_progress_chunks: int = 0, udp_progress_port: int = None):
+    def __init__(self, algorithm: HashAlgorithm = HashAlgorithm.MD5, worker_id: int = 0, notify_progress_chunks: int = 0, udp_progress_port: int = None):
         self.algorithm = algorithm
         self._hasher = self._create_hasher()
+        self.worker_id = worker_id
         self.notify_progress_chunks = notify_progress_chunks
         print("init 1")
         self.udp_progress_port = udp_progress_port
@@ -62,20 +63,23 @@ class HashCalculator:
         else:
             raise ValueError(f"Unsupported algorithm: {self.algorithm}")
 
-    def update_progress(self, file_path: str, bytes_processed: int, file_size: int):
+    def update_progress(self, file_path: str, files_processed: int, bytes_processed: int, file_size: int):
         """
         Update progress of the hash calculation.
         """
         print("Sending progress update to UDP:", self.udp_progress_port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.sendto(json.dumps({
-            "file_path": file_path,
-            "bytes_processed": bytes_processed,
-            "file_size": file_size
-        }).encode('utf-8'), ('localhost', self.udp_progress_port))
+        message = {
+            'worker_id': self.worker_id,
+            'bytes_processed': bytes_processed,
+            'current_file': file_path,
+            'files_processed': files_processed,
+            'message_type': 'progress'
+        }
+        sock.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.udp_progress_port))
         sock.close()
 
-    def calculate_file_hash(self, file_path: str, chunk_size: int = 8192) -> str:
+    def calculate_file_hash(self, file_path: str, files_processed: int, chunk_size: int = 8192) -> str:
         """
         Calculate hash of a file using the specified algorithm.
         
@@ -97,7 +101,7 @@ class HashCalculator:
                     bytes_processed += len(chunk)
                     if self.notify_progress_chunks > 0 and bytes_processed % self.notify_progress_chunks == 0:
                         print("Sending progress update to UDP:", self.udp_progress_port)
-                        self.update_progress(file_path, bytes_processed, file_size)
+                        self.update_progress(file_path, files_processed, bytes_processed, file_size)
             return hasher.hexdigest()
         except (IOError, OSError) as e:
             raise RuntimeError(f"Error reading file {file_path}: {e}")
