@@ -1,487 +1,381 @@
 """
-Multiprocessing file hashing with progress reporting
+Multiprocessing file hashing with load balancing and progress reporting
 """
 
 import multiprocessing as mp
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Event
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 import time
 import signal
-import threading
+import logging
+from datetime import datetime
+from dataclasses import dataclass
 
 from rich.console import Console
-from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-from rich.live import Live
 from rich.table import Table
 
-from .file_scanner import FileInfo
-from .hash_algorithms import HashAlgorithm, HashError
-from .hash_file import HashEntry
+try:
+    from .file_scanner import FileInfo
+    from .hash_algorithms import HashAlgorithm, HashProcessor
+except ImportError:
+    from file_scanner import FileInfo
+    from hash_algorithms import HashAlgorithm, HashProcessor
 
 
-class ProcessingResult:
-    """Result of file processing"""
-    def __init__(self, file_info: FileInfo, file_hash: str = None, other_hash: str = None, error: str = None):
-        self.file_info = file_info
-        self.file_hash = file_hash
-        self.other_hash = other_hash
-        self.error = error
-        self.success = error is None
+@dataclass
+class HashResult:
+    """Result of hashing a single file"""
+    file_info: FileInfo
+    primary_hash: str
+    secondary_hash: str
+    processing_time: float
+    bytes_processed: int
+    success: bool
+    error: Optional[str] = None
 
 
-def process_file_worker(file_info: FileInfo, algorithm_name: str, result_queue: Queue, progress_queue: Queue, thread_id: int = 0):
-    """Worker function to process a single file"""
-    from .hash_algorithms import get_algorithm
+@dataclass
+class WorkerStats:
+    """Statistics for a worker process"""
+    worker_id: int
+    files_processed: int
+    bytes_processed: int
+    total_time: float
+    current_file: Optional[str] = None
+    error_count: int = 0
+
+
+class ProgressQueue:
+    """Simple queue for progress updates"""
     
-    file_start_time = time.time()
+    def __init__(self):
+        self._queue = Queue()
     
-    def progress_callback(bytes_processed, file_size):
-        """Progress callback for file hashing"""
-        progress_queue.put({
-            'thread_id': thread_id,
-            'filename': file_info.relative_path.name,
-            'size': file_info.size,
-            'file_progress': bytes_processed,
-            'file_total': file_size,
-            'type': 'file_progress'
-        })
+    def put(self, item):
+        """Put progress update"""
+        self._queue.put(item)
     
-    try:
-        # Send start notification
-        progress_queue.put({
-            'thread_id': thread_id,
-            'filename': file_info.relative_path.name,
-            'size': file_info.size,
-            'type': 'file_start'
-        })
-        
-        # Get algorithm in worker process
-        algorithm = get_algorithm(algorithm_name)
-        
-        # Hash the file with progress callback
-        file_hash = algorithm.hash_file(file_info.path, progress_callback=progress_callback)
-        
-        # For now, use a simple secondary hash (file size + mtime)
-        # This could be enhanced with a different algorithm
-        secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
-        other_hash = algorithm.hash_data(secondary_data)
-        
-        file_end_time = time.time()
-        file_duration = file_end_time - file_start_time
-        
-        result = ProcessingResult(file_info, file_hash, other_hash)
-        result_queue.put(result)
-        
-        # Send completion notification with timing info
-        progress_queue.put({
-            'thread_id': thread_id,
-            'filename': file_info.relative_path.name,
-            'size': file_info.size,
-            'success': True,
-            'duration': file_duration,
-            'type': 'file_complete'
-        })
-        
-    except HashError as e:
-        file_end_time = time.time()
-        file_duration = file_end_time - file_start_time
-        
-        result = ProcessingResult(file_info, error=str(e))
-        result_queue.put(result)
-        
-        # Send error notification with timing info
-        progress_queue.put({
-            'thread_id': thread_id,
-            'filename': file_info.relative_path.name,
-            'size': file_info.size,
-            'success': False,
-            'error': str(e),
-            'duration': file_duration,
-            'type': 'file_complete'
-        })
+    def get_latest(self, timeout=None):
+        """Get the latest progress update"""
+        try:
+            return self._queue.get(timeout=timeout)
+        except:
+            return None
+    
+    def clear(self):
+        """Clear all pending updates"""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except:
+                break
 
 
-class FileProcessor:
-    """Handles multiprocessing file hashing with progress reporting"""
+def worker_process(worker_id: int, files: List[FileInfo], algorithm: HashAlgorithm,
+                  progress_queue: Queue, stop_event: Event, results_queue: Queue):
+    """
+    Worker process function for hashing files
     
-    def __init__(self, algorithm: HashAlgorithm, num_processes: int = 1, show_progress: bool = True):
+    Args:
+        worker_id: Unique identifier for this worker
+        files: List of files to process
+        algorithm: Hash algorithm to use
+        progress_queue: Queue for progress updates
+        stop_event: Event to signal stopping
+        results_queue: Queue for results
+    """
+    processor = HashProcessor(algorithm)
+    stats = WorkerStats(worker_id=worker_id, files_processed=0, bytes_processed=0, total_time=0)
+    start_time = time.time()
+    
+    # Process files (or skip if no files)
+    if not files:
+        # No files to process, send completion immediately
+        stats.total_time = time.time() - start_time
+        results_queue.put({
+            'worker_id': worker_id,
+            'completed': True,
+            'stats': stats
+        })
+        return
+    
+    for file_info in files:
+        if stop_event.is_set():
+            break
+        
+        try:
+            # Update progress
+            progress_queue.put({
+                'worker_id': worker_id,
+                'current_file': str(file_info.relative_path),
+                'files_processed': stats.files_processed,
+                'total_files': len(files),
+                'bytes_processed': stats.bytes_processed
+            })
+            
+            # Process file
+            file_start = time.time()
+            
+            def progress_callback(bytes_processed, total_bytes):
+                if stop_event.is_set():
+                    raise KeyboardInterrupt("Stopped by user")
+            
+            primary_hash = processor.compute_file_hash(file_info.path, progress_callback)
+            
+            # Compute secondary hash (MD5 for compatibility)
+            if algorithm != HashAlgorithm.MD5:
+                md5_processor = HashProcessor(HashAlgorithm.MD5)
+                secondary_hash = md5_processor.compute_file_hash(file_info.path)
+            else:
+                secondary_hash = primary_hash
+            
+            processing_time = time.time() - file_start
+            
+            # Update stats
+            stats.files_processed += 1
+            stats.bytes_processed += file_info.size
+            stats.total_time += processing_time
+            
+            # Send result
+            result = HashResult(
+                file_info=file_info,
+                primary_hash=primary_hash,
+                secondary_hash=secondary_hash,
+                processing_time=processing_time,
+                bytes_processed=file_info.size,
+                success=True
+            )
+            results_queue.put(result)
+            
+        except Exception as e:
+            stats.error_count += 1
+            result = HashResult(
+                file_info=file_info,
+                primary_hash="",
+                secondary_hash="",
+                processing_time=time.time() - file_start,
+                bytes_processed=0,
+                success=False,
+                error=str(e)
+            )
+            results_queue.put(result)
+            logging.error(f"Worker {worker_id} error processing {file_info.path}: {e}")
+    
+    # Final progress update
+    stats.total_time = time.time() - start_time
+    results_queue.put({
+        'worker_id': worker_id,
+        'completed': True,
+        'stats': stats
+    })
+
+
+class MultiprocessHashProcessor:
+    """Handles multiprocess file hashing with progress reporting"""
+    
+    def __init__(self, algorithm: HashAlgorithm = HashAlgorithm.MD5, 
+                 num_workers: Optional[int] = None, quiet: bool = False):
         self.algorithm = algorithm
-        self.num_processes = num_processes
-        self.show_progress = show_progress
-        self.should_stop = False
-        self.start_time = None
-        self.thread_stats = {}  # Track timing and bytes per thread
-        # Don't create console here - create it when needed to avoid pickle issues
+        self.num_workers = num_workers or mp.cpu_count()
+        self.quiet = quiet
+        self.console = Console()
+        
+        # Progress tracking
+        self.progress_queues = []
+        self.results_queue = Queue()
+        self.stop_event = Event()
+        self.workers = []
+        
+        # Results
+        self.results: List[HashResult] = []
+        self.worker_stats: List[WorkerStats] = []
+        
+        # Signal handling will be managed by the CLI
     
-    def print_thread_summary(self, file_batches: List[List[FileInfo]]):
-        """Print summary of files and sizes per thread"""
-        console = Console()
+    def process_files(self, file_lists: List[List[FileInfo]]) -> List[HashResult]:
+        """
+        Process files using multiple workers
         
-        table = Table(title="Thread Distribution Summary")
-        table.add_column("Thread", style="cyan")
-        table.add_column("Files", style="green", justify="right")
-        table.add_column("Total Size", style="yellow", justify="right")
-        table.add_column("Avg File Size", style="blue", justify="right")
+        Args:
+            file_lists: List of file lists, one per worker
         
-        for i, batch in enumerate(file_batches):
-            if batch:  # Only show non-empty batches
-                file_count = len(batch)
-                total_size = sum(f.size for f in batch)
-                avg_size = total_size // file_count if file_count > 0 else 0
-                
-                # Format sizes
-                total_size_str = f"{total_size:,} bytes"
-                avg_size_str = f"{avg_size:,} bytes"
-                
-                table.add_row(
-                    f"Thread {i+1}",
-                    str(file_count),
-                    total_size_str,
-                    avg_size_str
-                )
-        
-        console.print(table)
-    
-    def print_timing_statistics(self, results: List[ProcessingResult]):
-        """Print detailed timing and performance statistics"""
-        console = Console()
-        
-        if not self.start_time:
-            return
-        
-        total_duration = time.time() - self.start_time
-        
-        # Calculate total stats
-        total_files = len(results)
-        total_bytes = sum(r.file_info.size for r in results if r.success)
-        
-        # Create timing statistics table
-        timing_table = Table(title="Performance Statistics")
-        timing_table.add_column("Metric", style="cyan")
-        timing_table.add_column("Value", style="green")
-        
-        timing_table.add_row("Total Time", f"{total_duration:.2f} seconds")
-        timing_table.add_row("Total Files", str(total_files))
-        timing_table.add_row("Total Bytes", f"{total_bytes:,} bytes")
-        timing_table.add_row("Overall Speed", f"{total_bytes/total_duration:,.0f} bytes/sec")
-        
-        console.print(timing_table)
-        
-        # Create per-thread statistics table
-        if self.thread_stats:
-            thread_table = Table(title="Per-Thread Statistics")
-            thread_table.add_column("Thread", style="cyan")
-            thread_table.add_column("Files", style="green", justify="right")
-            thread_table.add_column("Bytes", style="yellow", justify="right")
-            thread_table.add_column("Time", style="blue", justify="right")
-            thread_table.add_column("Speed", style="magenta", justify="right")
-            
-            for thread_id, stats in self.thread_stats.items():
-                if stats['files_processed'] > 0:
-                    thread_duration = stats['total_duration']
-                    bytes_processed = stats['bytes_processed']
-                    speed = bytes_processed / thread_duration if thread_duration > 0 else 0
-                    
-                    thread_table.add_row(
-                        f"Thread {thread_id + 1}",
-                        str(stats['files_processed']),
-                        f"{bytes_processed:,}",
-                        f"{thread_duration:.2f}s",
-                        f"{speed:,.0f} bytes/sec"
-                    )
-            
-            console.print(thread_table)
-    
-    def process_files(self, file_batches: List[List[FileInfo]]) -> List[ProcessingResult]:
-        """Process files using multiprocessing with progress reporting"""
-        if not file_batches:
+        Returns:
+            List of HashResult objects
+        """
+        if not file_lists:
             return []
         
-        # Show thread summary
-        if self.show_progress:
-            self.print_thread_summary(file_batches)
+        self.results.clear()
+        self.worker_stats.clear()
+        self.stop_event.clear()
         
-        self.start_time = time.time()
+        # Track total processing time
+        start_time = time.time()
         
-        if self.num_processes == 1:
-            # Single process mode
-            return self._process_files_single(file_batches[0])
+        # Create progress queues for each worker
+        self.progress_queues = [Queue() for _ in range(len(file_lists))]
         
-        # Multiprocessing mode
-        return self._process_files_multiprocess(file_batches)
-    
-    def _process_files_single(self, files: List[FileInfo]) -> List[ProcessingResult]:
-        """Process files in single process mode"""
-        results = []
-        
-        if self.show_progress:
-            console = Console()
-            with Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                "[progress.percentage]{task.percentage:>3.0f}%",
-                "({task.completed}/{task.total})",
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console
-            ) as progress:
-                task = progress.add_task("Processing files", total=len(files))
-                
-                for file_info in files:
-                    try:
-                        # Create progress callback for single-threaded mode
-                        def progress_callback(bytes_processed, file_size):
-                            progress_percent = (bytes_processed / file_size) * 100
-                            progress.update(task, description=f"Processing {file_info.relative_path.name} ({progress_percent:.1f}%)")
-                        
-                        file_hash = self.algorithm.hash_file(file_info.path, progress_callback=progress_callback)
-                        secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
-                        other_hash = self.algorithm.hash_data(secondary_data)
-                        
-                        result = ProcessingResult(file_info, file_hash, other_hash)
-                        results.append(result)
-                        
-                        progress.update(task, advance=1, description=f"✓ {file_info.relative_path.name}")
-                        
-                    except HashError as e:
-                        result = ProcessingResult(file_info, error=str(e))
-                        results.append(result)
-                        progress.update(task, advance=1, description=f"✗ Error: {file_info.relative_path.name}")
-        else:
-            # No progress reporting
-            for file_info in files:
-                try:
-                    file_hash = self.algorithm.hash_file(file_info.path)
-                    secondary_data = f"{file_info.size}:{file_info.mtime}".encode()
-                    other_hash = self.algorithm.hash_data(secondary_data)
-                    
-                    result = ProcessingResult(file_info, file_hash, other_hash)
-                    results.append(result)
-                    
-                except HashError as e:
-                    result = ProcessingResult(file_info, error=str(e))
-                    results.append(result)
-        
-        return results
-    
-    def _process_files_multiprocess(self, file_batches: List[List[FileInfo]]) -> List[ProcessingResult]:
-        """Process files using multiple processes"""
-        result_queue = mp.Queue()
-        progress_queue = mp.Queue()
-        processes = []
-        
-        # Start worker processes
-        for thread_id, batch in enumerate(file_batches):
-            if not batch:  # Skip empty batches
-                continue
-                
-            from .hash_algorithms import get_algorithm_key
-            process = Process(
-                target=self._process_batch_worker,
-                args=(batch, get_algorithm_key(self.algorithm), result_queue, progress_queue, thread_id)
+        # Start workers
+        self.workers = []
+        for i, files in enumerate(file_lists):
+            # Always start worker, even if no files (it will send completion immediately)
+            worker = Process(
+                target=worker_process,
+                args=(i, files, self.algorithm, self.progress_queues[i], 
+                      self.stop_event, self.results_queue)
             )
-            process.start()
-            processes.append(process)
+            worker.start()
+            self.workers.append(worker)
         
-        results = []
+        if not self.workers:
+            return []
         
-        if self.show_progress:
-            # Collect all files for progress tracking
-            total_files = sum(len(batch) for batch in file_batches)
-            
-            console = Console()
-            with Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                "[progress.percentage]{task.percentage:>3.0f}%",
-                "({task.completed}/{task.total})",
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console
-            ) as progress:
-                # Create individual progress bars for each batch/thread
-                tasks = []
-                for i, batch in enumerate(file_batches):
-                    if batch:  # Only create task for non-empty batches
-                        task_id = progress.add_task(
-                            f"Thread {i+1}: Processing files", 
-                            total=len(batch)
-                        )
-                        tasks.append((task_id, len(batch)))
+        # Collect results and show simple progress
+        total_files = sum(len(files) for files in file_lists)
+        last_update = time.time()
+        
+        if not self.quiet:
+            self.console.print(f"[blue]Processing {total_files} files with {len(self.workers)} workers...[/blue]")
+        
+        # Collect results with timeout
+        timeout_start = time.time()
+        timeout_duration = 300  # 5 minutes timeout
+        completed_workers = 0
+        total_workers = len(self.workers)
+        
+        while completed_workers < total_workers and not self.stop_event.is_set():
+            if time.time() - timeout_start > timeout_duration:
+                self.console.print("[yellow]Timeout reached, stopping...[/yellow]")
+                break
                 
-                # Track completed files per thread
-                completed_per_thread = [0] * len(tasks)
-                current_files = [""] * len(tasks)  # Track current file being processed
-                file_progress = [0.0] * len(tasks)  # Track file-level progress
-                
-                # Initialize thread statistics
-                for i in range(len(tasks)):
-                    self.thread_stats[i] = {
-                        'files_processed': 0,
-                        'bytes_processed': 0,
-                        'total_duration': 0.0,
-                        'start_time': time.time()
-                    }
-                
-                # Set up signal handler for CTRL-C
-                def signal_handler(signum, frame):
-                    self.should_stop = True
-                    console.print("\n[yellow]Received interrupt signal. Stopping gracefully...[/yellow]")
-                
-                signal.signal(signal.SIGINT, signal_handler)
-                
-                # Collect results and update progress
-                last_write_time = time.time()
-                write_interval = 5.0  # Write hashes every 5 seconds
-                
-                while not self.should_stop:
-                    # Check for progress updates
-                    try:
-                        while True:
-                            update = progress_queue.get_nowait()
-                            
-                            # Get thread ID from the update
-                            thread_id = update.get('thread_id', 0)
-                            
-                            if thread_id < len(tasks):
-                                task_id, _ = tasks[thread_id]
-                                filename = update['filename']
-                                if len(filename) > 25:
-                                    filename = filename[:22] + "..."
-                                
-                                update_type = update.get('type', 'file_complete')
-                                
-                                if update_type == 'file_start':
-                                    current_files[thread_id] = filename
-                                    file_progress[thread_id] = 0.0
-                                    progress.update(
-                                        task_id, 
-                                        description=f"Thread {thread_id+1}: {filename}"
-                                    )
-                                elif update_type == 'file_progress':
-                                    file_total = update.get('file_total', 1)
-                                    file_progress_bytes = update.get('file_progress', 0)
-                                    file_progress[thread_id] = (file_progress_bytes / file_total) * 100
-                                    
-                                    progress.update(
-                                        task_id, 
-                                        description=f"Thread {thread_id+1}: {filename} ({file_progress[thread_id]:.1f}%)"
-                                    )
-                                elif update_type == 'file_complete':
-                                    completed_per_thread[thread_id] += 1
-                                    status = "✓" if update.get('success', True) else "✗"
-                                    current_files[thread_id] = ""
-                                    
-                                    # Update thread statistics
-                                    if thread_id in self.thread_stats:
-                                        self.thread_stats[thread_id]['files_processed'] += 1
-                                        self.thread_stats[thread_id]['bytes_processed'] += update.get('size', 0)
-                                        self.thread_stats[thread_id]['total_duration'] += update.get('duration', 0)
-                                    
-                                    progress.update(
-                                        task_id, 
-                                        advance=1, 
-                                        description=f"Thread {thread_id+1}: {status} {filename}"
-                                    )
-                    except:
-                        pass
-                    
-                    # Check for results
-                    try:
-                        result = result_queue.get(timeout=0.1)
-                        results.append(result)
-                    except:
-                        pass
-                    
-                    # Check if all files are completed
-                    total_completed = sum(completed_per_thread)
-                    if total_completed >= total_files:
-                        break
-                    
-                    # Periodic hash writing
-                    current_time = time.time()
-                    if current_time - last_write_time > write_interval:
-                        # Trigger periodic write (this will be handled by the caller)
-                        last_write_time = current_time
-                    
-                    # Small delay to prevent busy waiting
-                    time.sleep(0.01)
-                
-                # Collect any remaining results
-                while not result_queue.empty():
-                    try:
-                        result = result_queue.get_nowait()
-                        results.append(result)
-                    except:
-                        break
-                
-                # Clean up processes if stopped early
-                if self.should_stop:
-                    console.print("[yellow]Stopping worker processes...[/yellow]")
-                    for process in processes:
-                        if process.is_alive():
-                            process.terminate()
-                            process.join(timeout=2)
-                            if process.is_alive():
-                                process.kill()
-        else:
-            # No progress reporting - just collect results
-            for process in processes:
-                process.join()
-            
-            while not result_queue.empty():
-                try:
-                    result = result_queue.get_nowait()
-                    results.append(result)
-                except:
+            try:
+                result = self.results_queue.get(timeout=2.0)
+                if isinstance(result, HashResult):
+                    self.results.append(result)
+                    # Show progress every few seconds
+                    if not self.quiet and time.time() - last_update > 3.0:
+                        self.console.print(f"[blue]Processed {len(self.results)}/{total_files} files...[/blue]")
+                        last_update = time.time()
+                elif isinstance(result, dict) and result.get('completed'):
+                    completed_workers += 1
+                    if 'stats' in result:
+                        self.worker_stats.append(result['stats'])
+                        if not self.quiet:
+                            self.console.print(f"[blue]Worker {result['stats'].worker_id} completed: {result['stats'].files_processed} files, {result['stats'].bytes_processed} bytes[/blue]")
+            except Exception as e:
+                if not self.quiet:
+                    self.console.print(f"[yellow]Timeout or error in result collection: {e}[/yellow]")
+                # Check if workers are still alive
+                alive_workers = [w for w in self.workers if w.is_alive()]
+                if not alive_workers:
                     break
+                continue
         
-        # Wait for all processes to complete
-        for process in processes:
-            if process.is_alive():
-                process.join()
+        # Force cleanup of workers
+        for worker in self.workers:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join(timeout=2.0)
         
-        return results
+        # Store the total processing time
+        self.total_processing_time = time.time() - start_time
+        
+        if not self.quiet:
+            self.console.print(f"[green]Completed processing {len(self.results)} files[/green]")
+        
+        return self.results
     
-    def _process_batch_worker(self, files: List[FileInfo], algorithm_name: str, result_queue: Queue, progress_queue: Queue, thread_id: int = 0):
-        """Worker function to process a batch of files"""
-        for file_info in files:
-            process_file_worker(file_info, algorithm_name, result_queue, progress_queue, thread_id)
     
-    def get_summary_stats(self, results: List[ProcessingResult]) -> Dict[str, Any]:
-        """Get summary statistics from processing results"""
-        total_files = len(results)
-        successful = sum(1 for r in results if r.success)
-        failed = total_files - successful
+    def get_statistics(self) -> Dict:
+        """Get processing statistics"""
+        if not self.results:
+            return {}
         
-        total_size = sum(r.file_info.size for r in results if r.success)
+        total_files = len(self.results)
+        successful_files = sum(1 for r in self.results if r.success)
+        failed_files = total_files - successful_files
+        total_bytes = sum(r.bytes_processed for r in self.results if r.success)
+        # Use actual wall clock time instead of sum of individual processing times
+        total_time = getattr(self, 'total_processing_time', 0.0)
+        avg_speed = total_bytes / total_time if total_time > 0 else 0
         
         return {
             'total_files': total_files,
-            'successful': successful,
-            'failed': failed,
-            'total_size': total_size,
-            'errors': [r.error for r in results if not r.success]
+            'successful_files': successful_files,
+            'failed_files': failed_files,
+            'total_bytes': total_bytes,
+            'total_time': total_time,
+            'avg_speed_bytes_per_sec': avg_speed,
+            'worker_stats': [
+                {
+                    'worker_id': stats.worker_id,
+                    'files_processed': stats.files_processed,
+                    'bytes_processed': stats.bytes_processed,
+                    'total_time': stats.total_time,
+                    'error_count': stats.error_count,
+                    'avg_speed': stats.bytes_processed / stats.total_time if stats.total_time > 0 else 0
+                }
+                for stats in self.worker_stats
+            ]
         }
     
-    def print_summary(self, results: List[ProcessingResult]):
-        """Print processing summary"""
-        stats = self.get_summary_stats(results)
+    def display_statistics(self):
+        """Display processing statistics"""
+        stats = self.get_statistics()
+        if not stats:
+            return
         
-        console = Console()
-        table = Table(title="Processing Summary")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
+        # Overall statistics
+        overall_table = Table(title="Processing Statistics", show_header=True)
+        overall_table.add_column("Metric", style="cyan")
+        overall_table.add_column("Value", style="green")
         
-        table.add_row("Total files", str(stats['total_files']))
-        table.add_row("Successful", str(stats['successful']))
-        table.add_row("Failed", str(stats['failed']))
-        table.add_row("Total size", f"{stats['total_size']:,} bytes")
+        overall_table.add_row("Total Files", str(stats['total_files']))
+        overall_table.add_row("Successful", str(stats['successful_files']))
+        overall_table.add_row("Failed", str(stats['failed_files']))
+        overall_table.add_row("Total Bytes", f"{stats['total_bytes']:,}")
+        overall_table.add_row("Total Time", f"{stats['total_time']:.2f}s")
+        overall_table.add_row("Avg Speed", f"{stats['avg_speed_bytes_per_sec'] / (1024*1024):.2f} MB/s")
         
-        console.print(table)
+        self.console.print(overall_table)
         
-        if stats['errors']:
-            console.print("\n[bold red]Errors encountered:[/bold red]")
-            for error in stats['errors']:
-                console.print(f"  • {error}")
+        # Per-worker statistics
+        if stats['worker_stats']:
+            worker_table = Table(title="Per-Worker Statistics", show_header=True)
+            worker_table.add_column("Worker", style="cyan")
+            worker_table.add_column("Files", style="blue")
+            worker_table.add_column("Bytes", style="green")
+            worker_table.add_column("Time", style="yellow")
+            worker_table.add_column("Speed", style="red")
+            worker_table.add_column("Errors", style="red")
+            
+            for worker_stat in stats['worker_stats']:
+                worker_table.add_row(
+                    f"Worker {worker_stat['worker_id']}",
+                    str(worker_stat['files_processed']),
+                    f"{worker_stat['bytes_processed']:,}",
+                    f"{worker_stat['total_time']:.2f}s",
+                    f"{worker_stat['avg_speed'] / (1024*1024):.2f} MB/s",
+                    str(worker_stat['error_count'])
+                )
+            
+            self.console.print(worker_table)
+    
+    def stop(self):
+        """Stop processing"""
+        self.stop_event.set()
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            if worker.is_alive():
+                worker.join(timeout=2.0)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join()
+
+
+def create_processor(algorithm: HashAlgorithm, num_workers: Optional[int] = None, 
+                    quiet: bool = False) -> MultiprocessHashProcessor:
+    """Factory function to create a hash processor"""
+    return MultiprocessHashProcessor(algorithm, num_workers, quiet)

@@ -1,23 +1,32 @@
 """
-Command line interface for filehasher
+Command line interface for filehasher v2
 """
 
-import multiprocessing
 import sys
 import signal
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+import logging
 
 import click
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
 
-from .hash_algorithms import ALGORITHMS, get_algorithm, benchmark_algorithms, create_test_file, cleanup_test_file
-from .file_scanner import FileScanner
-from .processor import FileProcessor
-from .hash_file import HashFile, HashEntry
+try:
+    from .hash_algorithms import HashAlgorithm, HashBenchmark, get_algorithm_from_string
+    from .file_scanner import FileScanner
+    from .processor import MultiprocessHashProcessor
+    from .hash_file import HashFile, HashEntry
+except ImportError:
+    from hash_algorithms import HashAlgorithm, HashBenchmark, get_algorithm_from_string
+    from file_scanner import FileScanner
+    from processor import MultiprocessHashProcessor
+    from hash_file import HashFile, HashEntry
 
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 console = Console()
 
@@ -25,151 +34,101 @@ console = Console()
 @click.group()
 @click.version_option(version="2.0.0", prog_name="filehasher")
 def cli():
-    """Filehasher - A modern file hashing and comparison tool"""
+    """FileHasher v2 - A modern file hashing and comparison tool"""
     pass
 
 
 @cli.command()
 @click.argument('directory', type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option('--algorithm', '-a', default='md5', 
-              help=f'Hash algorithm to use. Available: {", ".join(ALGORITHMS.keys())}')
+              help='Hash algorithm (md5, sha1, sha256, sha512, blake2b, blake2s)')
 @click.option('--output', '-o', type=click.Path(path_type=Path),
-              help='Output hash file path (default: directory_name.hashes)')
-@click.option('--processes', '-m', default='1',
-              help='Number of processes to use (default: 1, use "auto" for CPU count)')
+              help='Output hash file path (default: directory.hashes)')
+@click.option('--workers', '-w', type=int, default=None,
+              help='Number of worker processes (default: CPU count)')
 @click.option('--quiet', '-q', is_flag=True, help='Suppress progress output')
 @click.option('--follow-symlinks', is_flag=True, help='Follow symbolic links')
-@click.option('--update', '-u', is_flag=True, help='Update existing hash file, only hash changed files')
+@click.option('--update', '-u', is_flag=True, 
+              help='Update existing hash file, only hash changed files')
 def generate(directory: Path, algorithm: str, output: Optional[Path], 
-             processes: str, quiet: bool, follow_symlinks: bool, update: bool):
+            workers: Optional[int], quiet: bool, follow_symlinks: bool, update: bool):
     """Generate hash file for a directory"""
     
-    # Parse processes option
-    if processes == 'auto':
-        num_processes = multiprocessing.cpu_count()
-    else:
-        try:
-            num_processes = int(processes)
-            if num_processes < 1:
-                raise click.BadParameter("Number of processes must be at least 1")
-        except ValueError:
-            raise click.BadParameter("Processes must be a number or 'auto'")
-    
-    # Set default output file
-    if output is None:
-        output = directory.name + '.hashes'
-    
-    # Get hash algorithm
     try:
-        hash_algorithm = get_algorithm(algorithm)
-    except ValueError as e:
-        raise click.BadParameter(str(e))
-    
-    console.print(f"[bold green]Generating hashes for:[/bold green] {directory}")
-    console.print(f"[bold blue]Algorithm:[/bold blue] {hash_algorithm.name}")
-    console.print(f"[bold blue]Output:[/bold blue] {output}")
-    console.print(f"[bold blue]Processes:[/bold blue] {num_processes}")
-    if update:
-        console.print(f"[bold blue]Mode:[/bold blue] Update existing hash file")
-    
-    # Scan directory
-    scanner = FileScanner(directory, follow_symlinks=follow_symlinks)
-    
-    try:
-        files = scanner.scan_directory()
+        # Parse algorithm
+        hash_algorithm = get_algorithm_from_string(algorithm)
         
-        # Handle update mode
-        files_to_process = files
-        if update and Path(output).exists():
-            # Load existing hash file
-            existing_hash_file = HashFile(Path(output))
-            existing_hash_file.read_entries()
-            
-            # Filter files that need updating
-            files_to_process = [f for f in files if existing_hash_file.needs_update(f)]
-            
-            if not files_to_process:
-                console.print("[green]No files need updating![/green]")
-                return
-            
-            console.print(f"[bold green]Found {len(files)} total files, {len(files_to_process)} need updating[/bold green]")
+        # Determine output file
+        if output is None:
+            output = directory.with_suffix('.hashes')
+        
+        # Check if updating existing file
+        hash_file = HashFile(output)
+        existing_entries = {}
+        if update and output.exists():
+            console.print(f"[blue]Reading existing hash file: {output}[/blue]")
+            hash_file.read()  # Read the hash file first
+            existing_entries = hash_file.get_file_info_map()
+        
+        # Scan directory
+        console.print(f"[blue]Scanning directory: {directory}[/blue]")
+        scanner = FileScanner(follow_symlinks=follow_symlinks)
+        
+        if update and existing_entries:
+            # Use efficient update scanning - only scan files that need updating
+            files_to_process = scanner.scan_directory_for_update(directory, existing_entries)
+            console.print(f"[blue]Found {len(files_to_process)} files to update[/blue]")
         else:
-            console.print(f"[bold green]Found {len(files)} files to process[/bold green]")
+            # Full directory scan for new hash file
+            files_to_process = scanner.scan_directory(directory)
         
         if not files_to_process:
-            console.print("[yellow]No files found to process[/yellow]")
+            console.print("[yellow]No files to process[/yellow]")
             return
         
-        # Load balance files across processes
-        file_batches = scanner.load_balance_files(files_to_process, num_processes)
+        # Distribute files across workers
+        if workers is None:
+            workers = 1  # Start with single worker for simplicity
+        
+        file_lists = scanner.distribute_files_for_processing(workers)
         
         # Process files
-        processor = FileProcessor(hash_algorithm, num_processes, show_progress=not quiet)
-        results = processor.process_files(file_batches)
+        processor = MultiprocessHashProcessor(hash_algorithm, workers, quiet)
+        results = processor.process_files(file_lists)
         
-        # Create or update hash file
-        hash_file = HashFile(Path(output))
+        if not results:
+            console.print("[red]No files were processed successfully[/red]")
+            return
         
-        if update and Path(output).exists():
-            # Update mode: load existing entries and update/add new ones
-            hash_file.read_entries()
-            
-            # Preserve metadata from existing file
-            if not hash_file.metadata:
-                hash_file.write_metadata_header(directory)
-            
-            # Remove old entries for files we're updating
-            updated_paths = {r.file_info.relative_path for r in results}
-            hash_file.entries = [e for e in hash_file.entries 
-                               if Path(e.directory) / e.filename not in updated_paths]
-        else:
-            # New file: write header
-            hash_file.write_header(directory)
-        
-        # Add new/updated entries
+        # Convert results to hash entries
+        entries = []
         for result in results:
             if result.success:
                 entry = HashEntry(
-                    file_hash=result.file_hash,
-                    other_hash=result.other_hash,
-                    directory=str(result.file_info.relative_path.parent) if result.file_info.relative_path.parent != Path('.') else '.',
-                    filename=result.file_info.relative_path.name,
-                    file_size=result.file_info.size,
+                    primary_hash=result.primary_hash,
+                    secondary_hash=result.secondary_hash,
+                    directory=result.file_info.directory,
+                    filename=result.file_info.filename,
+                    size=result.file_info.size,
                     inode=result.file_info.inode,
                     mtime=result.file_info.mtime,
                     is_symlink=result.file_info.is_symlink
                 )
-                hash_file.add_entry(entry, algorithm, write_to_file=not update)
-            else:
-                # Add symlinks as commented entries
-                if result.file_info.is_symlink:
-                    entry = HashEntry(
-                        file_hash='',
-                        other_hash='',
-                        directory=str(result.file_info.relative_path.parent) if result.file_info.relative_path.parent != Path('.') else '.',
-                        filename=result.file_info.relative_path.name,
-                        file_size=result.file_info.size,
-                        inode=result.file_info.inode,
-                        mtime=result.file_info.mtime,
-                        is_symlink=True
-                    )
-                    hash_file.add_entry(entry, write_to_file=not update)
+                entries.append(entry)
         
-        # Rewrite the entire file in update mode
-        if update and Path(output).exists():
-            hash_file.write_all_entries(algorithm)
+        # Write hash file
+        console.print(f"[blue]Writing hash file: {output}[/blue]")
+        hash_file.write(entries, directory, hash_algorithm, update_mode=update)
         
-        # Print summary
-        processor.print_summary(results)
+        # Display statistics
+        if not quiet:
+            processor.display_statistics()
         
-        # Print timing statistics
-        processor.print_timing_statistics(results)
-        
-        action = "updated" if update else "created"
-        console.print(f"[bold green]Hash file {action}:[/bold green] {output}")
+        console.print(f"[green]✓ Hash file generated: {output}[/green]")
         
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception("Error in generate command")
         sys.exit(1)
 
 
@@ -179,167 +138,269 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
               default='cleanup_duplicates.sh',
               help='Output script path (default: cleanup_duplicates.sh)')
 def duplicates(hash_file: Path, output: Path):
-    """Find duplicates within a hash file and generate cleanup script"""
-    
-    console.print(f"[bold green]Finding duplicates in:[/bold green] {hash_file}")
+    """Find duplicate files in a hash file"""
     
     try:
         # Read hash file
-        file_hash = HashFile(Path(hash_file))
-        entries = file_hash.read_entries()
-        
-        if not entries:
-            console.print("[yellow]No entries found in hash file[/yellow]")
-            return
+        console.print(f"[blue]Reading hash file: {hash_file}[/blue]")
+        hash_file_obj = HashFile(hash_file)
+        entries = hash_file_obj.read()
         
         # Find duplicates
-        duplicates = file_hash.find_duplicates()
+        duplicates_dict = hash_file_obj.get_duplicates()
         
-        if not duplicates:
-            console.print("[green]No duplicates found![/green]")
+        if not duplicates_dict:
+            console.print("[green]No duplicate files found[/green]")
             return
         
-        console.print(f"[bold blue]Found {len(duplicates)} duplicate groups[/bold blue]")
-        
         # Generate cleanup script
+        console.print(f"[blue]Generating cleanup script: {output}[/blue]")
+        
         with open(output, 'w') as f:
             f.write("#!/bin/bash\n")
             f.write("# Cleanup script for duplicate files\n")
             f.write("# Uncomment the lines you want to execute\n\n")
             
-            for i, (hash_value, duplicate_entries) in enumerate(duplicates.items(), 1):
-                f.write(f"# Duplicate group {i} (hash: {hash_value})\n")
+            for i, (hash_val, duplicate_entries) in enumerate(duplicates_dict.items(), 1):
+                f.write(f"# Duplicate group {i} (hash: {hash_val[:16]}...)\n")
                 
-                # Keep the first file, remove the rest
-                keep_file = duplicate_entries[0]
-                f.write(f"# KEEP: {keep_file.directory}/{keep_file.filename}\n")
-                
-                for entry in duplicate_entries[1:]:
-                    full_path = Path(entry.directory) / entry.filename
-                    f.write(f"# rm '{full_path}'\n")
+                for j, entry in enumerate(duplicate_entries):
+                    f.write(f"# rm '{entry.relative_path}'\n")
                 
                 f.write("\n")
         
-        console.print(f"[bold green]Cleanup script generated:[/bold green] {output}")
-        console.print("[yellow]Review the script and uncomment the lines you want to execute[/yellow]")
+        # Make script executable
+        output.chmod(0o755)
+        
+        # Display summary
+        total_duplicates = sum(len(group) for group in duplicates_dict.values())
+        total_groups = len(duplicates_dict)
+        
+        table = Table(title="Duplicate Files Found")
+        table.add_column("Group", style="cyan")
+        table.add_column("Files", style="blue")
+        table.add_column("Size", style="green")
+        table.add_column("Hash", style="yellow")
+        
+        for i, (hash_val, group) in enumerate(duplicates_dict.items(), 1):
+            total_size = sum(entry.size for entry in group)
+            table.add_row(
+                str(i),
+                str(len(group)),
+                f"{total_size:,} bytes",
+                hash_val[:16] + "..."
+            )
+        
+        console.print(table)
+        console.print(f"[green]✓ Cleanup script generated: {output}[/green]")
+        console.print(f"[blue]Found {total_groups} duplicate groups with {total_duplicates} files total[/blue]")
         
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception("Error in duplicates command")
         sys.exit(1)
 
 
 @cli.command()
-@click.argument('hash_file1', type=click.Path(exists=True, path_type=Path))
-@click.argument('hash_file2', type=click.Path(exists=True, path_type=Path))
+@click.argument('file1', type=click.Path(exists=True, path_type=Path))
+@click.argument('file2', type=click.Path(exists=True, path_type=Path))
 @click.option('--output', '-o', type=click.Path(path_type=Path),
               default='sync_directories.sh',
               help='Output script path (default: sync_directories.sh)')
-def compare(hash_file1: Path, hash_file2: Path, output: Path):
+def compare(file1: Path, file2: Path, output: Path):
     """Compare two hash files and generate sync script"""
-    
-    console.print(f"[bold green]Comparing hash files:[/bold green]")
-    console.print(f"  File 1: {hash_file1}")
-    console.print(f"  File 2: {hash_file2}")
     
     try:
         # Read hash files
-        file1 = HashFile(Path(hash_file1))
-        file2 = HashFile(Path(hash_file2))
+        console.print(f"[blue]Reading hash files...[/blue]")
+        hash_file1 = HashFile(file1)
+        hash_file2 = HashFile(file2)
         
-        entries1 = file1.read_entries()
-        entries2 = file2.read_entries()
+        entries1 = hash_file1.read()
+        entries2 = hash_file2.read()
         
-        if not entries1 or not entries2:
-            console.print("[yellow]One or both hash files are empty[/yellow]")
-            return
-        
-        # Find matches
-        matches = file1.compare_with(file2)
-        
-        if not matches:
-            console.print("[yellow]No matching files found between the two hash files[/yellow]")
-            return
-        
-        console.print(f"[bold blue]Found {len(matches)} matching files[/bold blue]")
+        # Compare files
+        comparison = hash_file1.compare_hash_files(hash_file2)
         
         # Generate sync script
+        console.print(f"[blue]Generating sync script: {output}[/blue]")
+        
         with open(output, 'w') as f:
             f.write("#!/bin/bash\n")
             f.write("# Sync script for matching files\n")
             f.write("# Uncomment the lines you want to execute\n\n")
             
-            for i, (hash_value, match_entries) in enumerate(matches.items(), 1):
-                f.write(f"# Match group {i} (hash: {hash_value})\n")
-                
-                # Group entries by source file
-                file1_entries = [e for e in match_entries if e in entries1]
-                file2_entries = [e for e in match_entries if e in entries2]
-                
-                for entry1 in file1_entries:
-                    for entry2 in file2_entries:
-                        if entry1.filename != entry2.filename:
-                            source_path = Path(entry1.directory) / entry1.filename
-                            target_path = Path(entry2.directory) / entry2.filename
-                            f.write(f"# mv '{source_path}' '{target_path}'\n")
-                
+            # Files only in file1 (to be removed or moved)
+            if comparison['only_in_file1']:
+                f.write("# Files only in first directory (consider removing)\n")
+                for entry in comparison['only_in_file1']:
+                    f.write(f"# rm '{entry.relative_path}'\n")
+                f.write("\n")
+            
+            # Files only in file2 (to be copied)
+            if comparison['only_in_file2']:
+                f.write("# Files only in second directory (consider copying)\n")
+                for entry in comparison['only_in_file2']:
+                    f.write(f"# cp '{entry.relative_path}' 'destination/'\n")
+                f.write("\n")
+            
+            # Matching files with different paths
+            if comparison['matching_hashes']:
+                f.write("# Files with same content but different names\n")
+                for match in comparison['matching_hashes']:
+                    f.write(f"# mv '{match['file1_path']}' '{match['file2_path']}'\n")
                 f.write("\n")
         
-        console.print(f"[bold green]Sync script generated:[/bold green] {output}")
-        console.print("[yellow]Review the script and uncomment the lines you want to execute[/yellow]")
+        # Make script executable
+        output.chmod(0o755)
+        
+        # Display comparison summary
+        table = Table(title="Comparison Results")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Count", style="blue")
+        
+        table.add_row("Files in first directory", str(comparison['total_file1']))
+        table.add_row("Files in second directory", str(comparison['total_file2']))
+        table.add_row("Common hashes", str(comparison['common_hashes']))
+        table.add_row("Only in first", str(len(comparison['only_in_file1'])))
+        table.add_row("Only in second", str(len(comparison['only_in_file2'])))
+        table.add_row("Same content, different names", str(len(comparison['matching_hashes'])))
+        
+        console.print(table)
+        console.print(f"[green]✓ Sync script generated: {output}[/green]")
         
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception("Error in compare command")
         sys.exit(1)
 
 
 @cli.command()
-@click.option('--size', '-s', default=10, help='Test file size in MB (default: 10)')
-@click.option('--algorithms', '-a', help='Comma-separated list of algorithms to test')
-def benchmark(size: int, algorithms: Optional[str]):
-    """Benchmark different hash algorithms"""
-    
-    console.print(f"[bold green]Benchmarking hash algorithms[/bold green]")
-    console.print(f"[bold blue]Test file size:[/bold blue] {size} MB")
-    
-    # Parse algorithms
-    if algorithms:
-        algo_list = [a.strip() for a in algorithms.split(',')]
-        invalid_algos = [a for a in algo_list if a not in ALGORITHMS]
-        if invalid_algos:
-            raise click.BadParameter(f"Invalid algorithms: {', '.join(invalid_algos)}")
-    else:
-        algo_list = list(ALGORITHMS.keys())
+@click.option('--size', '-s', type=int, default=10,
+              help='Test file size in MB (default: 10)')
+@click.option('--algorithms', '-a', default=None,
+              help='Comma-separated list of algorithms to test')
+@click.option('--iterations', '-i', type=int, default=3,
+              help='Number of iterations per algorithm (default: 3)')
+def benchmark(size: int, algorithms: Optional[str], iterations: int):
+    """Benchmark hash algorithms on your machine"""
     
     try:
-        # Create test file
-        console.print("[bold blue]Creating test file...[/bold blue]")
-        test_file = create_test_file(size)
+        # Parse algorithms
+        if algorithms:
+            algorithm_list = [get_algorithm_from_string(alg.strip()) 
+                            for alg in algorithms.split(',')]
+        else:
+            algorithm_list = None
         
-        try:
-            # Run benchmarks
-            console.print("[bold blue]Running benchmarks...[/bold blue]")
-            results = benchmark_algorithms(test_file, algo_list)
-            
-            # Display results
-            table = Table(title="Hash Algorithm Benchmarks")
-            table.add_column("Algorithm", style="cyan")
-            table.add_column("Time (seconds)", style="green")
-            table.add_column("Speed (MB/s)", style="yellow")
-            
-            for algo, time_taken in sorted(results.items(), key=lambda x: x[1]):
-                speed = size / time_taken if time_taken > 0 else 0
-                table.add_row(algo.upper(), f"{time_taken:.3f}", f"{speed:.1f}")
-            
-            console.print(table)
-            
-        finally:
-            # Clean up test file
-            cleanup_test_file(test_file)
+        # Run benchmark
+        console.print(f"[blue]Benchmarking hash algorithms...[/blue]")
+        console.print(f"[blue]Test file size: {size} MB, Iterations: {iterations}[/blue]")
+        
+        benchmark = HashBenchmark(size)
+        results = benchmark.benchmark_all(algorithm_list, iterations)
+        
+        # Display results
+        table = Table(title="Benchmark Results")
+        table.add_column("Algorithm", style="cyan")
+        table.add_column("Avg Time (s)", style="blue")
+        table.add_column("Min Time (s)", style="green")
+        table.add_column("Max Time (s)", style="yellow")
+        table.add_column("Throughput (MB/s)", style="red")
+        
+        for result in results:
+            table.add_row(
+                result['algorithm'].upper(),
+                f"{result['avg_time']:.4f}",
+                f"{result['min_time']:.4f}",
+                f"{result['max_time']:.4f}",
+                f"{result['throughput_mb_s']:.2f}"
+            )
+        
+        console.print(table)
+        
+        # Show recommendation
+        recommendation = benchmark.get_recommendation(results)
+        console.print(f"\n[green]Recommendation: {recommendation}[/green]")
         
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception("Error in benchmark command")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('hash_file', type=click.Path(exists=True, path_type=Path))
+def info(hash_file: Path):
+    """Display information about a hash file"""
+    
+    try:
+        # Read hash file
+        hash_file_obj = HashFile(hash_file)
+        entries = hash_file_obj.read()
+        stats = hash_file_obj.get_statistics()
+        
+        # Display header info
+        if hash_file_obj.header:
+            header_table = Table(title="Hash File Information")
+            header_table.add_column("Property", style="cyan")
+            header_table.add_column("Value", style="blue")
+            
+            header_table.add_row("File", str(hash_file))
+            header_table.add_row("Version", hash_file_obj.header.version)
+            header_table.add_row("Machine", hash_file_obj.header.machine)
+            header_table.add_row("Base Directory", hash_file_obj.header.base_directory)
+            header_table.add_row("User", hash_file_obj.header.user)
+            header_table.add_row("Generated", hash_file_obj.header.generated.strftime('%Y-%m-%d %H:%M:%S'))
+            header_table.add_row("Algorithm", stats['algorithm'])
+            
+            console.print(header_table)
+        
+        # Display statistics
+        stats_table = Table(title="File Statistics")
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Count", style="blue")
+        
+        stats_table.add_row("Total Entries", str(stats['total_entries']))
+        stats_table.add_row("Regular Files", str(stats['regular_files']))
+        stats_table.add_row("Symbolic Links", str(stats['symlinks']))
+        stats_table.add_row("Total Size", f"{stats['total_size']:,} bytes")
+        stats_table.add_row("Duplicate Groups", str(stats['duplicate_groups']))
+        stats_table.add_row("Duplicate Files", str(stats['duplicate_files']))
+        
+        console.print(stats_table)
+        
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception("Error in info command")
+        sys.exit(1)
+
+
+def main():
+    """Main entry point"""
+    # Set up signal handlers only for the main process
+    def signal_handler(signum, frame):
+        """Handle interrupt signals gracefully"""
+        if signum == signal.SIGINT:
+            console.print("\n[yellow]Received interrupt signal. Exiting...[/yellow]")
+            sys.exit(1)
+        elif signum == signal.SIGTERM:
+            console.print("\n[yellow]Received termination signal. Exiting...[/yellow]")
+            sys.exit(1)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        cli()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/red]")
+        logger.exception("Unexpected error in main")
         sys.exit(1)
 
 
 if __name__ == '__main__':
-    cli()
+    main()
