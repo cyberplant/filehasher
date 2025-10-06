@@ -35,13 +35,15 @@ class BenchmarkResult:
 class HashCalculator:
     """Handles hash calculation for different algorithms."""
     
-    def __init__(self, algorithm: HashAlgorithm = HashAlgorithm.MD5, notify_progress_chunks: int = 100, udp_progress_port: int = None):
+    def __init__(self, algorithm: HashAlgorithm = HashAlgorithm.MD5, notify_progress_chunks: int = 0, udp_progress_port: int = None):
         self.algorithm = algorithm
         self._hasher = self._create_hasher()
         self.notify_progress_chunks = notify_progress_chunks
         print("init 1")
         self.udp_progress_port = udp_progress_port
         print("init 2")
+        print("udp_progress_port", self.udp_progress_port)
+        print("notify_progress_chunks", self.notify_progress_chunks)
     
     def _create_hasher(self):
         """Create a new hasher instance for the current algorithm."""
@@ -94,7 +96,7 @@ class HashCalculator:
                     hasher.update(chunk)
                     bytes_processed += len(chunk)
                     if self.notify_progress_chunks > 0 and bytes_processed % self.notify_progress_chunks == 0:
-                        print("Sending progress update to UDP:", self.udp_progress_endpoint)
+                        print("Sending progress update to UDP:", self.udp_progress_port)
                         self.update_progress(file_path, bytes_processed, file_size)
             return hasher.hexdigest()
         except (IOError, OSError) as e:
