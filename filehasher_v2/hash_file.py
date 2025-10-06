@@ -47,14 +47,22 @@ class HashEntry:
         # This would need base directory context to be meaningful
         return Path(self.relative_path)
     
-    def to_line(self) -> str:
+    def to_line(self, algorithm: Optional['HashAlgorithm'] = None) -> str:
         """Convert to hash file line format"""
         if self.is_comment:
             return f"# {self.primary_hash}"
         elif self.is_symlink:
             return f"# SYMLINK|{self.directory}|{self.filename}|{self.size}|{self.inode}|{int(self.mtime)}"
         else:
-            return f"{self.primary_hash}|{self.secondary_hash}|{self.directory}|{self.filename}|{self.size}|{self.inode}|{int(self.mtime)}"
+            # Format: [file_metadata_hash]|[file_hash]|[directory]|[filename]|[file_size]|[inode]|[last_modification_time]
+            # Apply algorithm prefix to file_hash if not MD5
+            file_hash = self.primary_hash
+            if algorithm and algorithm != HashAlgorithm.MD5:
+                # Only add prefix if it's not already there
+                if not file_hash.startswith(f"{algorithm.value.upper()}:") and not file_hash.startswith(f"{algorithm.value.lower()}:") and not file_hash.startswith(f"{algorithm.value}:"):
+                    file_hash = f"{algorithm.value.upper()}:{self.primary_hash}"
+            
+            return f"{self.secondary_hash}|{file_hash}|{self.directory}|{self.filename}|{self.size}|{self.inode}|{int(self.mtime)}"
 
 
 @dataclass
@@ -77,8 +85,8 @@ class HashFileHeader:
             f"# Generated: {self.generated.strftime('%Y-%m-%d %H:%M:%S')}"
         ]
         
-        if self.algorithm:
-            lines.append(f"# Algorithm: {self.algorithm}")
+        # Note: Algorithm information is no longer stored in the header
+        # but indicated in the hash format itself for better flexibility
         
         return lines
 
@@ -212,10 +220,19 @@ class HashFile:
                     is_comment=True
                 )
             
-            # Regular entry
+            # Regular entry - new format: [file_metadata_hash]|[file_hash]|[directory]|[filename]|[file_size]|[inode]|[last_modification_time]
+            # Parse algorithm from file_hash if present
+            file_hash = parts[1] if len(parts) > 1 else ''
+            metadata_hash = parts[0]
+            
+            # Extract algorithm from file_hash (e.g., "SHA256:abc123" -> "abc123")
+            if ':' in file_hash:
+                algorithm_part, actual_hash = file_hash.split(':', 1)
+                file_hash = actual_hash
+            
             return HashEntry(
-                primary_hash=parts[0],
-                secondary_hash=parts[1] if len(parts) > 1 else '',
+                primary_hash=file_hash,
+                secondary_hash=metadata_hash,
                 directory=parts[2] if len(parts) > 2 else '.',
                 filename=parts[3] if len(parts) > 3 else '',
                 size=int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0,
@@ -258,7 +275,7 @@ class HashFile:
             base_directory=str(base_directory.resolve()),
             user=getpass.getuser(),
             generated=datetime.now(),
-            algorithm=algorithm.value
+            algorithm=None  # Algorithm info is now in the hash format itself
         )
         
         self.entries = entries
@@ -273,7 +290,7 @@ class HashFile:
                 
                 # Write entries
                 for entry in entries:
-                    f.write(entry.to_line() + '\n')
+                    f.write(entry.to_line(algorithm) + '\n')
             
             logger.info(f"Wrote {len(entries)} entries to {self.file_path}")
             

@@ -16,12 +16,12 @@ from rich.panel import Panel
 try:
     from .hash_algorithms import HashAlgorithm, HashBenchmark, get_algorithm_from_string
     from .file_scanner import FileScanner
-    from .processor import MultiprocessHashProcessor
+    from .processor import FileHashProcessor
     from .hash_file import HashFile, HashEntry
 except ImportError:
     from hash_algorithms import HashAlgorithm, HashBenchmark, get_algorithm_from_string
     from file_scanner import FileScanner
-    from processor import MultiprocessHashProcessor
+    from processor import FileHashProcessor
     from hash_file import HashFile, HashEntry
 
 # Setup logging
@@ -92,37 +92,27 @@ def generate(directory: Path, algorithm: str, output: Optional[Path],
         
         file_lists = scanner.distribute_files_for_processing(workers)
         
-        # Process files - use streaming for large datasets to avoid memory issues
-        processor = MultiprocessHashProcessor(hash_algorithm, workers, quiet)
+        # Process files using simplified ProcessPoolExecutor approach
+        processor = FileHashProcessor(hash_algorithm, workers, quiet)
         
-        # Use ProcessPoolExecutor for large datasets (>10000 files) to avoid queue overflow
-        if len(files_to_process) > 10000:
-            console.print("[blue]Large dataset detected, using ProcessPoolExecutor...[/blue]")
-            results = processor.process_files_with_executor(file_lists)
+        # Use streaming mode for very large datasets (>100k files) to avoid memory issues
+        if len(files_to_process) > 100000:
+            console.print("[blue]Very large dataset detected, using streaming mode...[/blue]")
+            stats = processor.process_files_streaming(file_lists, output, hash_algorithm)
             
-            if not results:
+            if stats['total_files'] == 0:
                 console.print("[red]No files were processed successfully[/red]")
                 return
             
-            # Convert results to hash entries
-            entries = []
-            for result in results:
-                if result.success:
-                    entry = HashEntry(
-                        primary_hash=result.primary_hash,
-                        secondary_hash=result.secondary_hash,
-                        directory=result.file_info.directory,
-                        filename=result.file_info.filename,
-                        size=result.file_info.size,
-                        inode=result.file_info.inode,
-                        mtime=result.file_info.mtime,
-                        is_symlink=result.file_info.is_symlink
-                    )
-                    entries.append(entry)
-            
-            # Write hash file
-            console.print(f"[blue]Writing hash file: {output}[/blue]")
-            hash_file.write(entries, directory, hash_algorithm, update_mode=update)
+            # Display statistics
+            if not quiet:
+                console.print("\n[bold]Processing Statistics[/bold]")
+                console.print(f"Total Files: {stats['total_files']:,}")
+                console.print(f"Successful: {stats['successful']:,}")
+                console.print(f"Failed: {stats['failed']:,}")
+                console.print(f"Total Bytes: {stats['total_bytes']:,}")
+                console.print(f"Total Time: {stats['total_time']:.2f}s")
+                console.print(f"Avg Speed: {stats['avg_speed']:.2f} MB/s")
         else:
             # Use regular mode for smaller datasets
             results = processor.process_files(file_lists)
