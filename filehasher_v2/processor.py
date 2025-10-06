@@ -64,7 +64,7 @@ class UDPProgressMessage:
 class UDPProgressListener:
     """UDP listener for progress updates from workers."""
     
-    def __init__(self, port: int = 0, progress_callback=None, debug: bool = False):
+    def __init__(self, port: int = 0, progress_callback=None, debug: bool = False, hash_file_handle=None, algorithm=None):
         self.port = port
         self.sock = None
         self.listening = False
@@ -77,6 +77,8 @@ class UDPProgressListener:
         self.update_interval = 1.0  # Update every second
         self.last_update_time = 0
         self.debug = debug
+        self.hash_file_handle = hash_file_handle
+        self.algorithm = algorithm
     
     def start(self):
         """Start UDP listener."""
@@ -149,6 +151,11 @@ class UDPProgressListener:
                 # Always call callback for file_progress to show real-time file progress
                 if self.progress_callback:
                     should_call_callback = True
+                    
+            elif message['message_type'] == 'hash_entry':
+                # Hash entry message - write to file asynchronously
+                if self.hash_file_handle and self.algorithm:
+                    self._write_hash_entry_from_message(message)
         
         # Call progress callback outside of lock to avoid deadlocks
         if should_call_callback:
@@ -168,6 +175,31 @@ class UDPProgressListener:
                 'worker_stats': self.worker_stats.copy(),
                 'current_file_progress': self.current_file_progress.copy()
             }
+    
+    def _write_hash_entry_from_message(self, message: dict):
+        """Write hash entry to file from UDP message."""
+        try:
+            # Split relative path into directory and filename
+            relative_path = Path(message['relative_path'])
+            directory = str(relative_path.parent) if relative_path.parent != Path('.') else '.'
+            filename = relative_path.name
+            
+            # Format file hash with algorithm prefix if needed
+            formatted_hash = message['file_hash']
+            if self.algorithm != HashAlgorithm.MD5:
+                formatted_hash = f"{self.algorithm.value.upper()}:{message['file_hash']}"
+            
+            # Write hash entry
+            hash_line = f"{message['metadata_hash']}|{formatted_hash}|{directory}|{filename}|{message['size']}|{message['inode']}|{message['mtime']}\n"
+            self.hash_file_handle.write(hash_line)
+            self.hash_file_handle.flush()  # Ensure immediate write to disk
+            
+            if self.debug:
+                print(f"DEBUG: Wrote hash entry for {filename}")
+                
+        except Exception as e:
+            if self.debug:
+                print(f"DEBUG: Error writing hash entry: {e}")
 
 
 class HashProcessor:
@@ -301,7 +333,7 @@ class HashProcessor:
                     print(f"\nDEBUG: Progress callback called with data: {progress_data}")
                 self._show_progress_update(progress_data, progress_tracker)
         
-        # Start UDP progress listener with callback
+        # Start UDP progress listener with callback (will be updated with hash file handle later)
         self._udp_listener = UDPProgressListener(progress_callback=progress_callback, debug=debug)
         self._udp_listener.start()
         
@@ -330,6 +362,10 @@ class HashProcessor:
             
             # Open hash file for appending
             with open(output_path, 'a', encoding='utf-8') as hash_file:
+                # Update UDP listener with hash file handle for async writing
+                self._udp_listener.hash_file_handle = hash_file
+                self._udp_listener.algorithm = self.algorithm
+                
                 # Process completed futures
                 for future in as_completed(future_to_batch):
                     if self._interrupted:
@@ -338,9 +374,8 @@ class HashProcessor:
                     try:
                         results = future.result()
                         if results:
-                            # Write all hash results from this batch
+                            # Add results to our collection (entries are written asynchronously via UDP)
                             for result in results:
-                                self._write_hash_entry(hash_file, result)
                                 self._results.append(result)
                     
                     except Exception as e:
@@ -349,7 +384,7 @@ class HashProcessor:
                         print(e)
                         continue
                 
-                # Write symlink entries
+                # Write symlink entries synchronously (these don't come from workers)
                 for symlink in symlinks:
                     self._write_symlink_entry(hash_file, symlink)
             
@@ -399,24 +434,45 @@ class HashProcessor:
         file_percent = (files_processed / total_files * 100) if total_files > 0 else 0
         byte_percent = (bytes_processed / total_bytes * 100) if total_bytes > 0 else 0
         
-        # Build progress line
-        progress_line = f"\rProcessed {files_processed}/{total_files} files ({file_percent:.1f}%), " \
-                       f"{self._format_bytes(bytes_processed)}/{self._format_bytes(total_bytes)} ({byte_percent:.1f}%)"
-        
-        # Add current file progress if available
+        # Clear previous lines and move cursor to top
+        worker_stats = progress.get('worker_stats', {})
         current_file_progress = progress.get('current_file_progress', {})
-        if current_file_progress:
-            # Show progress for the first active worker
-            for worker_id, file_progress in current_file_progress.items():
-                if file_progress.get('file_size', 0) > 0:
-                    current_file = Path(file_progress['current_file']).name if file_progress['current_file'] else "unknown"
-                    file_bytes = file_progress['bytes_processed']
-                    file_size = file_progress['file_size']
-                    file_percent = (file_bytes / file_size * 100) if file_size > 0 else 0
-                    progress_line += f" | {current_file}: {self._format_bytes(file_bytes)}/{self._format_bytes(file_size)} ({file_percent:.1f}%)"
-                break  # Only show one worker's current file progress
+        num_workers = max(len(worker_stats), len(current_file_progress)) if worker_stats or current_file_progress else 1
         
-        print(progress_line, end='', flush=True)
+        # Move cursor up by the number of worker lines + overall progress line
+        if hasattr(self, '_last_worker_lines'):
+            for _ in range(self._last_worker_lines + 1):
+                print("\033[A\033[K", end='')  # Move up and clear line
+        
+        # Print overall progress
+        overall_line = f"Overall: {files_processed}/{total_files} files ({file_percent:.1f}%), " \
+                      f"{self._format_bytes(bytes_processed)}/{self._format_bytes(total_bytes)} ({byte_percent:.1f}%)"
+        print(overall_line)
+        
+        # Print individual worker progress
+        worker_lines = 0
+        for worker_id in sorted(set(worker_stats.keys()) | set(current_file_progress.keys())):
+            worker_stat = worker_stats.get(worker_id, {})
+            file_progress = current_file_progress.get(worker_id, {})
+            
+            # Build worker line
+            worker_files = worker_stat.get('files_processed', 0)
+            worker_bytes = worker_stat.get('bytes_processed', 0)
+            worker_line = f"Worker {worker_id + 1}: {worker_files} files, {self._format_bytes(worker_bytes)}"
+            
+            # Add current file progress if available
+            if file_progress and file_progress.get('file_size', 0) > 0:
+                current_file = Path(file_progress['current_file']).name if file_progress['current_file'] else "unknown"
+                file_bytes = file_progress['bytes_processed']
+                file_size = file_progress['file_size']
+                file_percent = (file_bytes / file_size * 100) if file_size > 0 else 0
+                worker_line += f" | {current_file}: {self._format_bytes(file_bytes)}/{self._format_bytes(file_size)} ({file_percent:.1f}%)"
+            
+            print(worker_line)
+            worker_lines += 1
+        
+        # Store number of lines for next update
+        self._last_worker_lines = worker_lines
     
     
     
@@ -578,6 +634,27 @@ def process_file_batch_with_udp(worker_id: int, file_batch: List[FileInfo], algo
                     file_hash=file_hash
                 )
                 results.append(result)
+                
+                # Send hash entry via UDP for async writing
+                def send_hash_entry(result: HashResult):
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        message = {
+                            'worker_id': worker_id,
+                            'message_type': 'hash_entry',
+                            'metadata_hash': result.metadata_hash,
+                            'file_hash': result.file_hash,
+                            'relative_path': result.file_info.relative_path,
+                            'size': result.file_info.size,
+                            'inode': result.file_info.inode,
+                            'mtime': result.file_info.mtime
+                        }
+                        sock.sendto(json.dumps(message).encode('utf-8'), ('localhost', udp_port))
+                        sock.close()
+                    except:
+                        pass  # Ignore UDP errors
+                
+                send_hash_entry(result)
                 
                 # Update counters
                 files_processed += 1
